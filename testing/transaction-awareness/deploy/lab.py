@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 
-from render import TASK, password_hash, render
+from render import TASK, password_hash, render, validate_extra_fixtures
 from tls import generate_tls
 from transaction_config import configure_transactions
 
@@ -49,10 +49,14 @@ def main():
     create.add_argument("--openssl", default="openssl")
     create.add_argument("--keytool", default="keytool")
     create.add_argument("--htpasswd", default="htpasswd")
+    create.add_argument("--without-real-trino", action="store_true", help="Create only controlled backends for isolated fault tests")
+    create.add_argument("--extra-fixture", action="append", default=[])
     commands.add_parser("status")
     forward = commands.add_parser("forward", help="Keep loopback forwards running; stop with Ctrl-C")
     forward.add_argument("--base-port", type=int, default=18081)
     forward.add_argument("--ca-file", type=Path, required=True)
+    forward.add_argument("--without-real-trino", action="store_true")
+    forward.add_argument("--extra-fixture", action="append", default=[])
     feature = commands.add_parser("configure-transactions", help="Preserve lab credentials and configure the feature before artifact deployment")
     feature.add_argument("--enabled", action=argparse.BooleanOptionalAction, required=True)
     feature.add_argument("--env-file", type=Path, required=True, help="New private file for the test admin token")
@@ -99,7 +103,8 @@ def main():
         descriptor = os.open(runtime / "trino.env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as output:
             output.write("TX_TRINO_USER=user\nTX_TRINO_PASSWORD=" + shlex.quote(trino_password) + "\n")
-        resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed)
+        resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed,
+                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture)
         for name, data in [("namespace.json", resources["items"][0]), ("resources.json", resources)]:
             target = runtime / name
             with target.open("x") as output:
@@ -165,12 +170,19 @@ def main():
         upload_artifacts(lambda *parts, **options: kubectl("-n", args.namespace, *parts, **options), pods, jar)
         print("Artifact uploaded only to lab emptyDir volumes. Reopen forwards after pod replacement.")
     elif args.command == "forward":
+        validate_extra_fixtures(args.extra_fixture)
         pods = gateway_pods()
         if len(pods) < 2:
             raise SystemExit("At least two running Gateway pods are required")
         args.ca_file.resolve(strict=True)
         targets = [("pod/" + pod, 8443) for pod in pods]
-        targets += [("service/fixture-blue", 8080), ("service/fixture-green", 8080), ("service/trino-blue", 8443), ("service/trino-green", 8443), ("service/postgres-fault-proxy", 8080)]
+        targets += [("service/fixture-blue", 8080), ("service/fixture-green", 8080)]
+        if not args.without_real_trino:
+            targets += [("service/trino-blue", 8443), ("service/trino-green", 8443)]
+        targets.append(("service/postgres-fault-proxy", 8080))
+        fault_port = args.base_port + len(targets) - 1
+        extra_port = fault_port + 1
+        targets += [("service/fixture-" + name, 8080) for name in args.extra_fixture]
         if args.base_port < 1024 or args.base_port + len(targets) > 65536:
             raise SystemExit("Invalid local port range")
         processes = []
@@ -183,7 +195,10 @@ def main():
             print(f"TX_BACKEND_URLS=http://127.0.0.1:{fixture_port},http://127.0.0.1:{fixture_port + 1}", flush=True)
             print("TX_BACKEND_PROXY_URLS=http://fixture-blue:8080,http://fixture-green:8080", flush=True)
             print(f"TX_CA_FILE={args.ca_file.resolve()}", flush=True)
-            print(f"TX_DATABASE_FAULT_URL=http://127.0.0.1:{fixture_port + 4}", flush=True)
+            print(f"TX_DATABASE_FAULT_URL=http://127.0.0.1:{fault_port}", flush=True)
+            if args.extra_fixture:
+                extra_urls = {name: f"http://127.0.0.1:{extra_port + index}" for index, name in enumerate(args.extra_fixture)}
+                print("TX_EXTRA_BACKEND_URLS=" + json.dumps(extra_urls), flush=True)
             while all(process.poll() is None for process in processes):
                 time.sleep(1)
             raise SystemExit("A port-forward exited; stop tests and reopen forwards")

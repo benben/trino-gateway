@@ -106,6 +106,26 @@ class LabRenderTests(unittest.TestCase):
             self.assertNotIn("dummy-test-input", command)
             self.assertEqual(run.call_args.kwargs["input"], "dummy-test-input\n")
 
+    def test_fault_only_fixture_omits_real_coordinators_and_keeps_two_gateways(self):
+        items = render(self.namespace, "synthetic-test-password", "fake", proxy_source="proxy", include_real_trino=False)["items"]
+        self.assertFalse(any(item["metadata"]["name"].startswith("trino-") for item in items))
+        deployments = {item["metadata"]["name"]: item for item in items if item["kind"] == "Deployment"}
+        self.assertEqual(set(deployments), {"gateway", "postgres", "fixture-blue", "fixture-green", "postgres-fault-proxy"})
+        self.assertEqual(deployments["gateway"]["spec"]["replicas"], 2)
+
+    def test_extra_fixture_is_small_namespaced_and_reuses_only_script_config(self):
+        items = render(self.namespace, "synthetic-test-password", "fake", extra_fixtures=["cell-two"])["items"]
+        resources = [item for item in items if item["metadata"]["name"] == "fixture-cell-two"]
+        self.assertEqual({item["kind"] for item in resources}, {"Deployment", "Service"})
+        pod = next(item for item in resources if item["kind"] == "Deployment")["spec"]["template"]["spec"]
+        self.assertEqual(pod["containers"][0]["resources"]["requests"], {"cpu": "50m", "memory": "64Mi"})
+        self.assertEqual(pod["volumes"], [{"name": "source", "configMap": {"name": "fake-backend-source"}}])
+        self.assertEqual(pod["containers"][0]["args"][-2:], ["--identity", "cell-two"])
+        self.assertFalse(pod["automountServiceAccountToken"])
+        for names in [["blue"], ["green"], ["same", "same"], ["escape/namespace"], ["UPPER"], ["trailing-"]]:
+            with self.subTest(names=names), self.assertRaises(ValueError):
+                render(self.namespace, "synthetic-test-password", "fake", extra_fixtures=names)
+
 
 if __name__ == "__main__":
     unittest.main()

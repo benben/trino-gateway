@@ -71,6 +71,15 @@ python3 -m unittest -v test_protocol_boundaries
 python3 -m unittest -v test_reincarnation
 ```
 
+The separate `test_cross_group` suite needs a third independent fake backend and a different routing group. Supply `TX_DESTINATION_BACKEND_URL`, `TX_DESTINATION_BACKEND_NAME`, and `TX_DESTINATION_ROUTING_GROUP` after registering that backend. It changes the routing-group input for new requests and verifies that existing transactions and result continuations keep their original owner. This simulates a placement decision; it does not test customer provisioning, catalog migration, or tenant authorization.
+
+```sh
+python3 -m unittest -v test_cross_group
+python3 -m unittest -v test_capabilities
+```
+
+`test_capabilities` verifies advertised result URLs across replicas and rejects forged result and cancellation paths before backend dispatch.
+
 Missing fixture configuration is an error, not a skipped test. Baseline controls must pass before interpreting contract failures. There are no expected-failure annotations. Record the tested Gateway commit, image, process count, database configuration and commands with each run. Keep private runtime details in an untracked receipt outside the repository.
 
 ## Contract

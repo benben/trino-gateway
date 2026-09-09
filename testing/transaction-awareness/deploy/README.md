@@ -11,6 +11,19 @@ only same-namespace test traffic and cluster DNS. Resources request 3.5 CPUs and
 8.8125 GiB total; a quota caps requests and limits at 8 CPUs, 16 GiB, and 20 pods.
 PostgreSQL uses `emptyDir`: pod replacement loses all test state.
 
+For a separate fault-testing namespace, pass `--without-real-trino` to both
+`create` and `forward`. This retains two Gateways, PostgreSQL, the fault proxy,
+and two controlled backends, but omits both real coordinators. It requests
+1.5 CPUs and 2.8125 GiB across six pods. Give each lab its own namespace,
+runtime directory, and loopback port range. Never share its database or keys.
+
+For a controlled backend in another routing group, repeat `--extra-fixture`
+on `create` and `forward`, for example `--extra-fixture cell-two`. Each additional
+fixture requests 50 millicores and 64 MiB, reuses only the fixture script
+ConfigMap, and has an independent process identity and Service. Register its
+backend metadata in the intended routing group separately. Extra forwards
+follow the fault-proxy port and appear in `TX_EXTRA_BACKEND_URLS`.
+
 The real Trino coordinators use a randomly generated, per-lab password.
 Only its bcrypt hash is stored in the namespace-local authentication Secret.
 The private runtime file `trino.env` contains `TX_TRINO_USER` and

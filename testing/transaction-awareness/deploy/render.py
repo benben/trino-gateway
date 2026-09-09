@@ -23,7 +23,15 @@ def password_hash(password, htpasswd="htpasswd"):
     return hashed
 
 
-def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!"):
+def validate_extra_fixtures(names):
+    if len(set(names)) != len(names) or any(name in {"blue", "green"} or not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,29}[a-z0-9])?", name) for name in names):
+        raise ValueError("Extra fixture names must be unique DNS labels other than blue or green")
+
+
+def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=()):
+    validate_extra_fixtures(extra_fixtures)
+    if extra_fixtures and not fake_source:
+        raise ValueError("Extra fixtures require the controlled backend source")
     labels = {"task": TASK}
     objects = [{"apiVersion": "v1", "kind": "Namespace", "metadata": {
         "name": namespace, "labels": labels | {
@@ -98,11 +106,13 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
                [{"name": "config", "secret": {"secretName": "gateway-config"}}, {"name": "artifact", "emptyDir": {}}],
                [{"name": "config", "mountPath": "/etc/trino-gateway", "readOnly": True}, {"name": "artifact", "mountPath": "/artifact"}], replicas=2,
                command=["sh", "-c"], args=["exec java -Xmx512m -jar /usr/lib/trino-gateway/gateway-ha-jar-with-dependencies.jar /etc/trino-gateway/config.yaml"])
+    trino_colors = ["blue", "green"] if include_real_trino else []
     trino_auth = {"password.db": "user:" + trino_password_hash + "\n"}
-    for color in ["blue", "green"]:
+    for color in trino_colors:
         trino_auth["internal-secret-" + color] = hmac.new(password.encode(), ("trino-test-internal-" + color).encode(), hashlib.sha256).hexdigest()
-    add("Secret", "trino-test-auth", type="Opaque", stringData=trino_auth)
-    for color in ["blue", "green"]:
+    if include_real_trino:
+        add("Secret", "trino-test-auth", type="Opaque", stringData=trino_auth)
+    for color in trino_colors:
         name = "trino-" + color
         config(name, {"config.properties": "coordinator=true\nnode-scheduler.include-coordinator=true\nhttp-server.http.port=8080\nhttp-server.process-forwarded=true\nhttp-server.authentication.type=PASSWORD\nhttp-server.authentication.allow-insecure-over-http=true\ninternal-communication.shared-secret=${ENV:TRINO_INTERNAL_SECRET}\ndiscovery.uri=http://localhost:8080\nquery.max-memory-per-node=256MB\n",
                       "node.properties": "node.environment=transaction_test\nnode.data-dir=/data/trino\n",
@@ -118,8 +128,9 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
                    env=[{"name": "TRINO_INTERNAL_SECRET", "valueFrom": {"secretKeyRef": {"name": "trino-test-auth", "key": "internal-secret-" + color}}}])
     if fake_source:
         config("fake-backend-source", {"fake_trino.py": fake_source})
-        for color in ["blue", "green"]:
-            deployment("fixture-" + color, "python:3.12-alpine", "100m", "128Mi",
+        for color in ["blue", "green", *extra_fixtures]:
+            cpu, memory = ("100m", "128Mi") if color in {"blue", "green"} else ("50m", "64Mi")
+            deployment("fixture-" + color, "python:3.12-alpine", cpu, memory,
                        [{"name": "source", "configMap": {"name": "fake-backend-source"}}],
                        [{"name": "source", "mountPath": "/fixture", "readOnly": True}],
                        command=["python", "/fixture/fake_trino.py"], args=["--host", "0.0.0.0", "--port", "8080", "--identity", color])
@@ -160,6 +171,7 @@ def main():
     parser.add_argument("--fake-source", type=Path)
     parser.add_argument("--trino-password-file", type=Path, required=True)
     parser.add_argument("--htpasswd", default="htpasswd")
+    parser.add_argument("--extra-fixture", action="append", default=[])
     args = parser.parse_args()
     if not re.fullmatch(r"gateway-tx-lab-[a-z0-9-]+", args.namespace) or len(args.namespace) > 63:
         parser.error("namespace must be a dedicated gateway-tx-lab-* DNS label")
@@ -167,7 +179,7 @@ def main():
     if not re.fullmatch(r"[a-zA-Z0-9]{24,128}", password):
         parser.error("lab password must contain 24-128 alphanumeric characters")
     hashed = password_hash(args.trino_password_file.read_text().strip(), args.htpasswd)
-    print(json.dumps(render(args.namespace, password, args.fake_source.read_text() if args.fake_source else None, trino_password_hash=hashed), indent=2))
+    print(json.dumps(render(args.namespace, password, args.fake_source.read_text() if args.fake_source else None, trino_password_hash=hashed, extra_fixtures=args.extra_fixture), indent=2))
 
 
 if __name__ == "__main__":
