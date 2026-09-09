@@ -77,6 +77,24 @@ class FaultContract(GatewayFixture):
         self.assertGreaterEqual(response.status, 400, response.body)
         self.assert_new_uncertainty(before)
 
+    def test_trailing_json_bytes_do_not_complete_query(self):
+        self.configure(0, terminal_trailing_bytes=True)
+        initial = self.submit("SELECT 1")
+        self.assertEqual(initial.status, 200, initial.body)
+        before = self.pending_count()
+        response = request(through_gateway(initial.json()["nextUri"], self.gateways[1]))
+        self.assertGreaterEqual(response.status, 400, response.body)
+        self.assert_new_uncertainty(before)
+
+    def test_408_after_possible_acceptance_is_not_an_auth_rejection(self):
+        self.configure(0, initial_status=408)
+        before = self.pending_count()
+        transactions = len(self.state(0)["transactions"])
+        response = self.submit("START TRANSACTION")
+        self.assertGreaterEqual(response.status, 400, response.body)
+        self.assertEqual(len(self.state(0)["transactions"]), transactions + 1)
+        self.assert_new_uncertainty(before)
+
     def test_cancel_racing_result_keeps_uncertainty(self):
         initial = self.submit("SELECT 1")
         self.assertEqual(initial.status, 200, initial.body)

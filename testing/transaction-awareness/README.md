@@ -11,6 +11,8 @@ All endpoints must belong to an isolated, disposable test environment. The suite
 - `test_fake_trino.py`: local fixture self-tests. These establish fixture behavior, not Gateway correctness.
 - `test_gateway.py`: baseline controls and transaction contract assertions against separate Gateway processes sharing one PostgreSQL database.
 - `test_adversarial.py`: additional identity, replay, query-error and seal-interleaving assertions.
+- `test_protocol_boundaries.py`: canonical statement paths, heartbeat accounting and unsupported method/result-mode checks.
+- `test_reincarnation.py`: three blue/green reuse cycles with stale-generation and old-query rejection.
 - `network_fault_proxy.py`: TCP-transparent database fault boundary with an isolated HTTP control port.
 - `test_faults.py`: response-loss, conflicting-header, cancellation, database-outage and coordinator-restart assertions.
 - `deploy/`: environment setup and runtime configuration, maintained separately from the protocol suite.
@@ -22,11 +24,11 @@ python3 fake_trino.py --host 0.0.0.0 --port 8080 --identity blue
 python3 fake_trino.py --host 0.0.0.0 --port 8081 --identity green
 ```
 
-The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages and query cancellation. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
+The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages, `HEAD` heartbeats and query cancellation. It accepts a trailing slash on statement POSTs, as verified against real Trino. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
 
 Direct fixture controls are `GET /__test/state`, `POST /__test/reset`, `POST /__test/config`, `POST /__test/restart` and `POST /__test/release`. Each simulated process has a distinct `nodeId` and `coordinatorId`; query IDs use that coordinator suffix. Restart changes both identities and clears backend-local transactions and query results. It does not simulate process recovery or migrate a transaction.
 
-Configuration supports `start_header_page` and `clear_header_page` (0 for the initial response, 1 for the continuation), `hold_start`, `hold_poll`, `drop_start_response`, `drop_poll_response`, `duplicate_start_headers` (`same` or `conflict`), `force_transaction_id`, `query_error`, `fail_commit`, `lowercase_headers`, `malformed_terminal` and `terminal_padding_bytes`. Release can select a barrier with `{"kind":"start"}` or `{"kind":"poll"}`; the default releases both. State records request methods, paths, SQL and transaction headers, but not Authorization. Do not put real credentials or data in fixture queries.
+Configuration supports `start_header_page` and `clear_header_page` (0 for the initial response, 1 for the continuation), `hold_start`, `hold_poll`, `drop_start_response`, `drop_poll_response`, `duplicate_start_headers` (`same` or `conflict`), `force_transaction_id`, `query_error`, `fail_commit`, `lowercase_headers`, `malformed_terminal`, `terminal_trailing_bytes`, `terminal_padding_bytes` and `initial_status`. The last option changes the response status after backend acceptance; it tests ambiguous errors rather than authentication failures. Release can select a barrier with `{"kind":"start"}` or `{"kind":"poll"}`; the default releases both. State records request methods, paths, SQL and transaction headers, but not Authorization. Do not put real credentials or data in fixture queries.
 
 ## Configuration
 
@@ -40,14 +42,16 @@ Register the two fixture backends in the same Gateway routing group. Use distinc
 | `TX_BACKEND_PROXY_URLS` | Corresponding URLs registered with Gateway; defaults to the direct URLs. |
 | `TX_BACKEND_NAMES` | Registered names; defaults to `blue,green`. |
 | `TX_ROUTING_GROUP` | Shared fixture group; defaults to `transaction-test`. |
-| `TX_ADMIN_TOKEN` | Optional API-role bearer token for admin calls. |
-| `TX_QUERY_AUTHORIZATION` | Query authorization header; defaults to synthetic Basic credentials `user:test-password`. |
+| `TX_ADMIN_TOKEN` | Required bearer token for feature-enabled admin calls. Omit it only for the feature-disabled upstream baseline. |
+| `TX_QUERY_AUTHORIZATION` | Required query authorization header, supplied from disposable fixture credentials at runtime. There is no working default. |
 | `TX_READINESS_TIMEOUT_SECONDS` | Backend health convergence deadline; defaults to 120 seconds for upstream health polling. |
 | `TX_CA_FILE` | Optional private CA file for HTTPS fixture endpoints. Certificate and hostname verification remain enabled. |
 | `TX_DATABASE_FAULT_URL` | Direct URL for the isolated TCP proxy's HTTP control port. |
 | `TX_ALLOW_IRREVERSIBLE_FAULTS` | Must be `yes` for fault suites that intentionally leave uncertain obligations or restart a coordinator. |
 
 Keep actual endpoint values, secrets and raw environment output outside the repository. For transaction-aware runs, enable the feature and configure the same randomly generated identity key on every Gateway. See the feature configuration documentation for the key requirements. Do not disable authentication binding to make tests pass.
+
+The fixture setup must generate its credentials outside the repository. Tests use those runtime credentials for successful requests and generate different credentials for negative cases. Do not publish environment files or successful Authorization values.
 
 ## Run the suites independently
 
@@ -59,6 +63,8 @@ python3 -m unittest -v test_network_fault_proxy
 python3 -m unittest -v test_gateway.BaselineControls
 python3 -m unittest -v test_gateway.TransactionContract
 python3 -m unittest -v test_adversarial
+python3 -m unittest -v test_protocol_boundaries
+python3 -m unittest -v test_reincarnation
 ```
 
 Missing fixture configuration is an error, not a skipped test. Baseline controls must pass before interpreting contract failures. There are no expected-failure annotations. Record the tested Gateway commit, image, process count, database configuration and commands with each run. Keep private runtime details in an untracked receipt outside the repository.
@@ -67,7 +73,13 @@ Missing fixture configuration is an error, not a skipped test. Baseline controls
 
 The tests exercise transaction affinity across backend cutover and every configured Gateway, ownership discovered on continuation pages, unknown and malformed IDs, duplicate headers, identity replay, completion, backend URL reuse, pending admissions, drain races and explicit seal rejection. New transactions can move to the new backend; existing transactions cannot migrate between coordinators.
 
+Modern clients can advertise spooled-result encodings while still accepting inline results. The boundary test requires Gateway to remove that advertisement before forwarding and return a complete inline query result. The fake backend records the encoding header so an ignored advertisement cannot falsely pass this check.
+
 The admin contract uses `/gateway/transactions/backends/{name}/drain`, `/seal`, `/resume`, and `/gateway/transactions/cutover`. Resume and seal carry the current `generation` from drain status. Cutover is removed with `DELETE /gateway/transactions/cutover/{routingGroup}` during cleanup. A drain snapshot is not shutdown authorization: `drained` is true only after an atomic seal succeeds.
+
+With the feature enabled, the fixture changes placement through durable cutover and resume operations. Legacy activate/deactivate operations and active-flag changes must reject with HTTP 409. The upstream baseline uses those legacy operations because the durable API does not exist there. The backend-affinity assertions are the same in both modes.
+
+Reusing a fixed backend URL requires routing away, draining and sealing its old incarnation before restarting its process. `POST /gateway/transactions/backends/{name}/reincarnate` receives the expected old `generation` and `incarnation`. The replacement starts in `DRAINING` and requires an explicit resume. Old query bindings remain attached to the sealed historical incarnation; they must never reach the new process.
 
 Run each complete contract against a fresh fixture when collecting upstream failure evidence. Upstream cannot reconcile its missing ownership ledger; failed scenarios can leave backend-local transactions. The fixture does not pretend that direct backend cleanup reconciles an enabled Gateway ledger. A failed run must be diagnosed before reusing its state for drain assertions.
 

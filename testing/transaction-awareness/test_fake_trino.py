@@ -145,6 +145,46 @@ class FakeTrinoTests(unittest.TestCase):
         self.assertFalse(task.is_alive())
         self.assertEqual(responses[0].status, 200)
 
+    def test_head_heartbeat_has_no_body_and_does_not_close_transaction(self):
+        transaction = statement(self.url, "START TRANSACTION").values("X-Trino-Started-Transaction-Id")[0]
+        initial = statement(self.url, "SELECT 1", transaction)
+        response = request(initial.json()["nextUri"], "HEAD")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, b"")
+        self.assertIn(transaction, request(self.url + "/__test/state").json()["transactions"])
+        self.assertEqual(finish(initial, self.url)[-1].json()["data"], [["blue"]])
+
+    def test_trailing_slash_statement_matches_real_trino(self):
+        response = request(self.url + "/v1/statement/", "POST", "START TRANSACTION")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(response.values("X-Trino-Started-Transaction-Id")), 1)
+        self.assertEqual(request(self.url + "/__test/state").json()["requests"][0]["path"], "/v1/statement/")
+
+    def test_unexpected_method_is_recorded_before_rejection(self):
+        response = request(self.url + "/v1/statement/unknown", "PUT")
+        self.assertEqual(response.status, 405)
+        self.assertEqual(request(self.url + "/__test/state").json()["requests"][0]["method"], "PUT")
+
+    def test_unexpected_408_can_follow_backend_acceptance(self):
+        request(self.url + "/__test/config", "POST", '{"initial_status": 408}')
+        response = statement(self.url, "START TRANSACTION")
+        self.assertEqual(response.status, 408)
+        self.assertEqual(len(request(self.url + "/__test/state").json()["transactions"]), 1)
+
+    def test_terminal_trailing_bytes_are_not_valid_json(self):
+        import json
+        request(self.url + "/__test/config", "POST", '{"terminal_trailing_bytes": true}')
+        initial = statement(self.url, "SELECT 1")
+        response = request(initial.json()["nextUri"])
+        with self.assertRaises(json.JSONDecodeError):
+            response.json()
+
+    def test_records_query_data_encoding_without_recording_authorization(self):
+        statement(self.url, "SELECT 1", extra=[("X-Trino-Query-Data-Encoding", "json+zstd")])
+        recorded = request(self.url + "/__test/state").json()["requests"][0]
+        self.assertEqual(recorded["queryDataEncoding"], ["json+zstd"])
+        self.assertNotIn("authorization", {name.lower() for name in recorded})
+
 
 if __name__ == "__main__":
     unittest.main()

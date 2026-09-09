@@ -42,7 +42,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             pass
 
         def respond(self, status, value, headers=()):
-            body = b"" if status == 204 else value if isinstance(value, bytes) else json.dumps(value).encode()
+            body = b"" if status == 204 or self.command == "HEAD" else value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -68,6 +68,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
         def record(self, sql=None):
             entry = {"method": self.command, "path": self.path, "sql": sql,
                      "transactions": self.headers.get_all("X-Trino-Transaction-Id", []),
+                     "queryDataEncoding": self.headers.get_all("X-Trino-Query-Data-Encoding", []),
                      "user": self.headers.get("X-Trino-User")}
             with state.lock:
                 state.requests.append(entry)
@@ -120,6 +121,17 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 known = urlsplit(self.path).path in state.queries
             self.respond(204 if known else 404, {})
 
+        def do_HEAD(self):
+            self.record()
+            with state.lock:
+                known = urlsplit(self.path).path in state.queries
+            self.respond(200 if known else 404, {})
+
+        def do_PUT(self):
+            self.body()
+            self.record()
+            self.respond(405, {"error": "Unsupported method"})
+
         def do_POST(self):
             raw = self.body()
             path = urlsplit(self.path).path
@@ -149,11 +161,11 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                         state.poll_release.clear()
                 self.respond(200, {})
                 return
-            if path != "/v1/statement":
-                self.respond(404, {})
-                return
             sql = raw.decode()
             self.record(sql)
+            if path.rstrip("/") != "/v1/statement":
+                self.respond(404, {})
+                return
             command = " ".join(sql.strip().rstrip(";").upper().split())
             supplied = self.headers.get_all("X-Trino-Transaction-Id", [])
             transaction = supplied[0] if supplied else "NONE"
@@ -207,6 +219,8 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 terminal = result
                 if config.get("malformed_terminal"):
                     terminal = b"not-a-protocol-response"
+                elif config.get("terminal_trailing_bytes"):
+                    terminal = json.dumps(result).encode() + b" trailing-content"
                 elif config.get("terminal_padding_bytes"):
                     terminal["testPadding"] = "x" * min(int(config["terminal_padding_bytes"]), 4 * 1024 * 1024)
                 state.queries[poll_path] = (200, terminal, terminal_headers)
@@ -220,7 +234,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             if starts and config.get("drop_start_response"):
                 self.disconnect()
                 return
-            self.respond(200, first, initial_headers)
+            self.respond(int(config.get("initial_status", 200)), first, initial_headers)
 
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True

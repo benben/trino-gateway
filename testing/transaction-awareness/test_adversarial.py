@@ -6,7 +6,7 @@ import unittest
 import uuid
 
 from protocol import finish, request, through_gateway
-from test_gateway import GatewayFixture
+from test_gateway import GatewayFixture, different_authorization
 
 
 class IdentityContract(GatewayFixture):
@@ -59,7 +59,7 @@ class IdentityContract(GatewayFixture):
             self.complete(initial)
 
     def test_continuation_with_changed_credentials_rejects(self):
-        self.reject_continuation([("Authorization", "Basic dXNlcjphbm90aGVyLXBhc3N3b3Jk")])
+        self.reject_continuation([("Authorization", different_authorization())])
 
     def test_continuation_with_conflicting_transaction_rejects(self):
         self.reject_continuation([("X-Trino-Transaction-Id", str(uuid.uuid4()))])

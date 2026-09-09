@@ -38,6 +38,14 @@ The complete initial contract then ran with `python3 -m unittest -v test_gateway
 
 The missing-API failures establish incomplete feature coverage; the misrouting and forwarding failures establish the existing behavioral gap. All baseline and initial contract tests completed before transaction-awareness Java implementation began.
 
+## Expanded upstream checks
+
+After the initial checkpoint, 20 additional checks ran with `python3 -m unittest -v test_adversarial`. Gateway connections used HTTPS with certificate and hostname verification against the lab CA. The application remained upstream Gateway 21; PostgreSQL remained available throughout this run.
+
+Result: 20 tests in 296.597 seconds; 20 assertion failures, zero errors or skips. Thirteen failures concerned identity/context forwarding, continuation ownership, closed-start replay or lowercase-header affinity. Seven concerned missing durable-state or drain APIs. These additional tests were authored during implementation review; only the initial checkpoint above is the pre-implementation gate.
+
+A separate real-Trino check also confirmed that `POST /v1/statement/` accepts a trailing slash: a synthetic `SELECT 1` returned HTTP 200 and completed across five response pages. Therefore, exact-path-only Gateway accounting would leave a real protocol bypass. Source inspection confirmed that Trino's client sends `HEAD` heartbeats and its executing-statement resource returns an empty successful response. Heartbeats need accounting without terminal-query inference; they are not an unsupported method.
+
 ## Interpretation
 
 This proves that existing query-ID routing works in the lab while the two new transaction guarantees fail on upstream. It does not prove the later implementation, real-client compatibility, fault recovery or safe drain. The full acceptance matrix requires additional positive tests after implementation, including real Trino processes and deliberately forced fault interleavings.

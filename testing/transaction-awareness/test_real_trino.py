@@ -1,6 +1,8 @@
 """Real Trino protocol regressions against disposable coordinators and shared Gateways."""
 
 import os
+import base64
+import json
 import time
 import unittest
 
@@ -17,7 +19,12 @@ class RealTrinoFixture(unittest.TestCase):
             raise RuntimeError("At least two independently addressed Gateway replicas are required")
         cls.names = os.environ.get("TX_REAL_BACKEND_NAMES", "real-blue,real-green").split(",")
         cls.group = os.environ.get("TX_REAL_ROUTING_GROUP", "real-transaction-test")
-        cls.authorization = os.environ.get("TX_QUERY_AUTHORIZATION", "Basic dXNlcjp0ZXN0LXBhc3N3b3Jk")
+        cls.user = os.environ.get("TX_TRINO_USER", "user")
+        cls.authorization = os.environ.get("TX_QUERY_AUTHORIZATION")
+        if not cls.authorization:
+            cls.authorization = "Basic " + base64.b64encode((cls.user + ":" + os.environ["TX_TRINO_PASSWORD"]).encode()).decode()
+        cls.backend_urls = os.environ.get("TX_REAL_BACKEND_URLS", "https://127.0.0.1:18085,https://127.0.0.1:18086").split(",")
+        cls.coordinator_ids = [request(url + "/v1/info").json()["coordinatorId"] for url in cls.backend_urls]
         cls.admin_headers = []
         if os.environ.get("TX_ADMIN_TOKEN"):
             cls.admin_headers.append(("Authorization", "Bearer " + os.environ["TX_ADMIN_TOKEN"]))
@@ -27,7 +34,7 @@ class RealTrinoFixture(unittest.TestCase):
                        "POST", headers=self.admin_headers)
 
     def submit(self, sql, transaction="NONE", gateway=0):
-        return statement(self.gateways[gateway], sql, transaction, "user", self.group,
+        return statement(self.gateways[gateway], sql, transaction, self.user, self.group,
                          [("Authorization", self.authorization)])
 
     def consume(self, response, gateway=0, allow_error=False):
@@ -40,18 +47,26 @@ class RealTrinoFixture(unittest.TestCase):
         return pages
 
     def activate(self, index):
-        for gateway in range(len(self.gateways)):
-            for action, name in (("activate", self.names[index]), ("deactivate", self.names[1 - index])):
-                response = self.admin(action, name, gateway)
-                self.assertEqual(response.status, 200, response.body)
+        if os.environ.get("TX_ADMIN_TOKEN"):
+            response = request(self.gateways[0] + "/gateway/transactions/cutover", "POST",
+                               json.dumps({"routingGroup": self.group, "backendName": self.names[index]}),
+                               self.admin_headers + [("Content-Type", "application/json")])
+            self.assertEqual(response.status, 200, response.body)
+        else:
+            for gateway in range(len(self.gateways)):
+                for action, name in (("activate", self.names[index]), ("deactivate", self.names[1 - index])):
+                    response = self.admin(action, name, gateway)
+                    self.assertEqual(response.status, 200, response.body)
         deadline = time.monotonic() + 90
         for gateway in range(len(self.gateways)):
             while True:
                 response = self.submit("SELECT 1", gateway=gateway)
                 if response.status == 200:
-                    self.consume(response, gateway)
-                    break
-                self.assertIn(response.status, (500, 502, 503, 504), response.body)
+                    pages = self.consume(response, gateway)
+                    if pages[0].json()["id"].endswith("_" + self.coordinator_ids[index]):
+                        break
+                else:
+                    self.assertIn(response.status, (500, 502, 503, 504), response.body)
                 self.assertLess(time.monotonic(), deadline, "Real backend did not become routable")
                 time.sleep(0.2)
 
@@ -122,6 +137,7 @@ class RealTransactionContract(RealTrinoFixture):
         pages = self.consume(self.submit("ROLLBACK", transaction, gateway=1))
         self.assertTrue(any(page.values("X-Trino-Clear-Transaction-Id") for page in pages))
         self.nation_count(gateway=1)
+        self.assertTrue(all(page.json()["id"].endswith("_" + self.coordinator_ids[0]) for page in pages), "Rollback executed on a different coordinator")
 
 
 if __name__ == "__main__":

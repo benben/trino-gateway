@@ -1,5 +1,6 @@
 """Black-box transaction ownership contract for an isolated Gateway fixture."""
 
+import base64
 import concurrent.futures
 import json
 import os
@@ -17,6 +18,11 @@ def required_list(name, exactly_two=True):
     return values
 
 
+def different_authorization():
+    credential = ("user:" + uuid.uuid4().hex).encode()
+    return "Basic " + base64.b64encode(credential).decode()
+
+
 class GatewayFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -29,7 +35,9 @@ class GatewayFixture(unittest.TestCase):
         if len(cls.names) != 2 or len(cls.proxy_urls) != 2:
             raise RuntimeError("Exactly two backend names and registered proxy URLs are required")
         cls.group = os.environ.get("TX_ROUTING_GROUP", "transaction-test")
-        cls.authorization = os.environ.get("TX_QUERY_AUTHORIZATION", "Basic dXNlcjp0ZXN0LXBhc3N3b3Jk")
+        cls.authorization = os.environ.get("TX_QUERY_AUTHORIZATION", "")
+        if not cls.authorization:
+            raise RuntimeError("TX_QUERY_AUTHORIZATION must supply the disposable fixture's runtime credentials")
         cls.admin_headers = []
         if os.environ.get("TX_ADMIN_TOKEN"):
             cls.admin_headers = [("Authorization", "Bearer " + os.environ["TX_ADMIN_TOKEN"])]
@@ -81,15 +89,21 @@ class GatewayFixture(unittest.TestCase):
     def activate(self, index):
         target = self.names[index]
         old = self.names[1 - index]
-        for gateway in range(len(self.gateways)):
-            current = self.admin("/gateway/backend/all", gateway=gateway)
-            self.assertEqual(current.status, 200, current.body)
-            states = {backend["name"]: backend["active"] for backend in current.json()}
-            for action, name in (("activate", target), ("deactivate", old)):
-                if states.get(name) == (action == "activate"):
-                    continue
-                response = self.admin("/gateway/backend/" + action + "/" + name, "POST", gateway=gateway)
-                self.assertEqual(response.status, 200, response.body)
+        if self.admin_headers:
+            self.resume(index)
+            response = self.admin("/gateway/transactions/cutover", "POST",
+                                  {"routingGroup": self.group, "backendName": target})
+            self.assertEqual(response.status, 200, response.body)
+        else:
+            for gateway in range(len(self.gateways)):
+                current = self.admin("/gateway/backend/all", gateway=gateway)
+                self.assertEqual(current.status, 200, current.body)
+                states = {backend["name"]: backend["active"] for backend in current.json()}
+                for action, name in (("activate", target), ("deactivate", old)):
+                    if states.get(name) == (action == "activate"):
+                        continue
+                    response = self.admin("/gateway/backend/" + action + "/" + name, "POST", gateway=gateway)
+                    self.assertEqual(response.status, 200, response.body)
         expected = self.state(index)["identity"]
         deadline = time.monotonic() + float(os.environ.get("TX_READINESS_TIMEOUT_SECONDS", "120"))
         while True:
@@ -115,14 +129,16 @@ class GatewayFixture(unittest.TestCase):
                            hold_start=False, hold_poll=False, duplicate_start_headers=None,
                            force_transaction_id=None, query_error=False, fail_commit=False,
                            lowercase_headers=False, malformed_terminal=False,
-                           terminal_padding_bytes=0, drop_start_response=False, drop_poll_response=False)
+                           terminal_padding_bytes=0, terminal_trailing_bytes=False, initial_status=200,
+                           drop_start_response=False, drop_poll_response=False)
 
     def tearDown(self):
         for index in (0, 1):
             request(self.backends[index] + "/__test/release", "POST", "{}")
             self.configure(index, query_error=False, fail_commit=False,
                            drop_start_response=False, drop_poll_response=False,
-                           malformed_terminal=False, terminal_padding_bytes=0)
+                           malformed_terminal=False, terminal_padding_bytes=0,
+                           terminal_trailing_bytes=False, initial_status=200)
         for transaction in self.transactions:
             try:
                 finish(self.submit("ROLLBACK", transaction), self.gateways[0])
@@ -215,7 +231,7 @@ class TransactionContract(GatewayFixture):
         transaction = self.start()
         before = self.submissions()
         response = statement(self.gateways[1], "SELECT 1", transaction, "user", self.group,
-                             [("Authorization", "Basic dXNlcjphbm90aGVyLXBhc3N3b3Jk")])
+                             [("Authorization", different_authorization())])
         self.assertGreaterEqual(response.status, 400, response.body)
         self.assertLess(response.status, 500, response.body)
         self.assertEqual(self.submissions(), before)

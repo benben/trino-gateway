@@ -1,0 +1,51 @@
+name: Transaction awareness tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transaction-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6.0.0
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+      - name: PostgreSQL transaction ledger and protocol adapter
+        env:
+          TX_STORE_TEST_JDBC_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+          TX_STORE_TEST_USERNAME: postgres
+        run: >-
+          ./mvnw -B -ntp -pl gateway-ha -am test
+          -Dskip.installnodepnpm -Dskip.pnpm
+          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler'
+          -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Protocol and network fault fixture self-tests
+        working-directory: testing/transaction-awareness
+        run: python3 -m unittest -v test_fake_trino test_network_fault_proxy
+      - name: Disposable lab tooling tests
+        working-directory: testing/transaction-awareness/deploy
+        run: python3 -m unittest -v test_render test_transaction_config
