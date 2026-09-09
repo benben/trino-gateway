@@ -61,11 +61,15 @@ authorization and capacity must already be ready; Gateway does not provision the
    retry window, not merely a zero running-query count.
 5. POST `/backends/{old}/seal` with the observed `generation`. Only a successful
    response with `drained: true` authorizes retirement under this protocol.
-   A stale generation or new outstanding obligation prevents sealing.
+   A stale generation or new outstanding obligation prevents sealing. Use the
+   returned generation for subsequent operations; sealing advances it.
 6. Stop the old coordinator through the external deployment controller.
 
 `readyToSeal` is an observation, not permission to stop a backend. Sealing shares
 the admission lock and rejects later continuations to that incarnation.
+An operation prepared before sealing cannot resume that sealed generation.
+The external deployment controller must serialize retirement with intentional
+resumption: a newly authorized resume explicitly revokes the retirement decision.
 
 To reuse a blue/green slot, first move every durable route away, seal it, then
 replace its coordinator. POST `/backends/{name}/reincarnate` with the old

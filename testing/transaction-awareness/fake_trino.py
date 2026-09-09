@@ -25,6 +25,8 @@ class State:
             self.coordinator_id = uuid.uuid4().hex[:5]
             self.transactions = {}
             self.queries = {}
+            self.partial_cancel_paths = {}
+            self.cancelled_stages = []
             self.requests = []
             self.config = {"start_header_page": 0, "clear_header_page": 0,
                            "hold_start": False, "hold_poll": False}
@@ -81,6 +83,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                                        "transactions": dict(state.transactions),
                                        "nodeId": state.node_id, "coordinatorId": state.coordinator_id,
                                        "requests": list(state.requests),
+                                       "cancelledStages": list(state.cancelled_stages),
                                        "config": dict(state.config)})
                 return
             if path == "/v1/info":
@@ -101,6 +104,9 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 return
             self.record()
             with state.lock:
+                if path in state.partial_cancel_paths:
+                    self.respond(405, {"error": "Partial cancellation requires DELETE"})
+                    return
                 response = state.queries.get(path)
                 config = dict(state.config)
             if response is None:
@@ -118,13 +124,22 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             self.body()
             self.record()
             with state.lock:
-                known = urlsplit(self.path).path in state.queries
+                path = urlsplit(self.path).path
+                if path in state.partial_cancel_paths:
+                    state.cancelled_stages.append(dict(state.partial_cancel_paths[path]))
+                    self.respond(204, {})
+                    return
+                known = path in state.queries
             self.respond(204 if known else 404, {})
 
         def do_HEAD(self):
             self.record()
             with state.lock:
-                known = urlsplit(self.path).path in state.queries
+                path = urlsplit(self.path).path
+                if path in state.partial_cancel_paths:
+                    self.respond(405, {})
+                    return
+                known = path in state.queries
             self.respond(200 if known else 404, {})
 
         def do_PUT(self):
@@ -219,6 +234,8 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 terminal = result
                 if config.get("malformed_terminal"):
                     terminal = b"not-a-protocol-response"
+                elif config.get("duplicate_next_uri"):
+                    terminal = (json.dumps(result)[:-1] + ',"nextUri":' + json.dumps(self.base() + poll_path) + ',"nextUri":null}').encode()
                 elif config.get("terminal_trailing_bytes"):
                     terminal = json.dumps(result).encode() + b" trailing-content"
                 elif config.get("terminal_padding_bytes"):
@@ -227,6 +244,10 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 first = {"id": query_id, "infoUri": result["infoUri"],
                          "nextUri": self.base() + poll_path,
                          "stats": {**result["stats"], "state": "RUNNING"}, "warnings": []}
+                if config.get("partial_cancel"):
+                    cancel_path = "/v1/statement/executing/partialCancel/" + query_id + "/1/token/1"
+                    state.partial_cancel_paths[cancel_path] = {"queryId": query_id, "stage": 1}
+                    first["partialCancelUri"] = self.base() + cancel_path
             if starts and config.get("hold_start"):
                 if not state.release.wait(30):
                     self.respond(503, {"error": "Test barrier timed out"})

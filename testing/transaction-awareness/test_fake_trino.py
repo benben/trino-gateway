@@ -8,6 +8,37 @@ from protocol import finish, request, statement
 
 
 class FakeTrinoTests(unittest.TestCase):
+    def test_duplicate_next_uri_contains_two_conflicting_raw_fields(self):
+        request(self.url + "/__test/config", "POST", '{"duplicate_next_uri": true}')
+        initial = statement(self.url, "SELECT 1")
+        terminal = request(initial.json()["nextUri"])
+        self.assertEqual(terminal.status, 200)
+        self.assertEqual(terminal.body.count(b'"nextUri"'), 2)
+        self.assertIn(b'"nextUri":"http://', terminal.body)
+        self.assertTrue(terminal.body.endswith(b'"nextUri":null}'))
+
+    def test_partial_cancel_preserves_transaction_and_result(self):
+        transaction = statement(self.url, "START TRANSACTION").values("X-Trino-Started-Transaction-Id")[0]
+        request(self.url + "/__test/config", "POST", '{"partial_cancel": true}')
+        initial = statement(self.url, "SELECT 1", transaction)
+        uri = initial.json()["partialCancelUri"]
+        self.assertIn("/executing/partialCancel/" + initial.json()["id"] + "/1/token/1", uri)
+        cancelled = request(uri, "DELETE")
+        self.assertEqual(cancelled.status, 204)
+        state = request(self.url + "/__test/state").json()
+        self.assertIn(transaction, state["transactions"])
+        self.assertEqual(state["cancelledStages"], [{"queryId": initial.json()["id"], "stage": 1}])
+        self.assertEqual(finish(initial, self.url)[-1].json()["data"], [["blue"]])
+
+    def test_partial_cancel_rejects_wrong_stage_slug_and_methods(self):
+        request(self.url + "/__test/config", "POST", '{"partial_cancel": true}')
+        uri = statement(self.url, "SELECT 1").json()["partialCancelUri"]
+        self.assertEqual(request(uri.replace("/1/token/1", "/2/token/1"), "DELETE").status, 404)
+        self.assertEqual(request(uri.replace("/token/", "/wrong/"), "DELETE").status, 404)
+        self.assertEqual(request(uri, "GET").status, 405)
+        self.assertEqual(request(uri, "HEAD").status, 405)
+        self.assertEqual(request(self.url + "/__test/state").json()["cancelledStages"], [])
+
     def setUp(self):
         self.server = make_server()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)

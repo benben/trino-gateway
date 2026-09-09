@@ -36,14 +36,19 @@ class ReincarnationContract(GatewayFixture):
                     sealed = self.admin(path + "/seal", "POST", {"generation": old["generation"]})
                     self.assertEqual(sealed.status, 200, sealed.body)
                     self.assertTrue(sealed.json()["drained"])
+                    sealed_generation = sealed.json()["generation"]
+                    self.assertGreater(sealed_generation, old["generation"])
+                    stale_resume = self.admin(path + "/resume", "POST", {"generation": old["generation"]}, gateway=1)
+                    self.assertEqual(stale_resume.status, 409, stale_resume.body)
+                    self.assertTrue(self.backend_status(current).json()["sealed"])
                     restarted = request(self.backends[current] + "/__test/restart", "POST", "{}")
                     self.assertEqual(restarted.status, 200, restarted.body)
-                    expected = {"generation": old["generation"], "incarnation": old["incarnation"]}
+                    expected = {"generation": sealed_generation, "incarnation": old["incarnation"]}
                     replacement = self.admin(path + "/reincarnate", "POST", expected, gateway=1)
                     self.assertEqual(replacement.status, 200, replacement.body)
                     new = replacement.json()
                     self.assertNotEqual(new["incarnation"], old["incarnation"])
-                    self.assertGreater(new["generation"], old["generation"])
+                    self.assertGreater(new["generation"], sealed_generation)
                     self.assertEqual(new["state"], "DRAINING")
                     self.assertFalse(new["acceptingNewQueries"])
                     stale = self.admin(path + "/reincarnate", "POST", expected)

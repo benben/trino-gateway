@@ -13,6 +13,8 @@
  */
 package io.trino.gateway.ha.transaction;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -70,7 +72,8 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 public class TransactionAwarenessService
 {
     private static final String ADMISSION_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".admission";
-    private static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+    private static final ObjectMapper JSON = new ObjectMapper(JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private final TransactionAwarenessConfiguration config;
     private final TransactionStore store;
     private final TransactionIdentity identity;
@@ -247,6 +250,10 @@ public class TransactionAwarenessService
                 throw error(502, "Backend returned contradictory transaction lifecycle headers");
             }
             boolean terminal = !body.hasNonNull("nextUri");
+            JsonNode state = body.path("stats").path("state");
+            if (!state.isTextual() || (terminal && !List.of("FINISHED", "FAILED").contains(state.asText()))) {
+                throw error(502, "Backend returned inconsistent query completion state");
+            }
             List<String> capabilities = new ArrayList<>();
             for (String field : List.of("nextUri", "partialCancelUri")) {
                 if (body.hasNonNull(field)) {

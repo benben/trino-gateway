@@ -269,6 +269,59 @@ class TestTransactionStore
     }
 
     @Test
+    void sealingInvalidatesPreviouslyPreparedResumeAndSeal()
+    {
+        long draining = first.beginDrain("blue").generation();
+        var sealed = first.seal("blue", draining);
+        expect(STALE_GENERATION, () -> second.resume("blue", draining));
+        expect(STALE_GENERATION, () -> second.seal("blue", draining));
+        assertThat(sealed.generation()).isEqualTo(draining + 1);
+        assertThat(second.seal("blue", sealed.generation())).isEqualTo(sealed);
+        expect(NOT_ACTIVE, () -> first.admitNew("blue", "owner", "group"));
+        assertThat(second.resume("blue", sealed.generation()).generation()).isEqualTo(sealed.generation() + 1);
+        assertThat(first.admitNew("blue", "owner", "group")).isNotNull();
+    }
+
+    @Test
+    void competingSealAndResumeShareOneGenerationFence()
+            throws Exception
+    {
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            for (int iteration = 0; iteration < 20; iteration++) {
+                long generation = first.beginDrain("blue").generation();
+                CountDownLatch start = new CountDownLatch(1);
+                var sealed = executor.submit(() -> attemptLifecycle(start, () -> first.seal("blue", generation)));
+                var resumed = executor.submit(() -> attemptLifecycle(start, () -> second.resume("blue", generation)));
+                start.countDown();
+                boolean sealWon = sealed.get(5, TimeUnit.SECONDS);
+                boolean resumeWon = resumed.get(5, TimeUnit.SECONDS);
+                assertThat(new boolean[] {sealWon, resumeWon}).containsExactlyInAnyOrder(true, false);
+                var current = first.drainStatus("blue");
+                assertThat(current.generation()).isEqualTo(generation + 1);
+                assertThat(current.state()).isEqualTo(sealWon ? "SEALED" : "ACTIVE");
+                if (sealWon) {
+                    expect(NOT_ACTIVE, () -> second.admitNew("blue", "owner", "group"));
+                    second.resume("blue", current.generation());
+                }
+            }
+        }
+    }
+
+    private static boolean attemptLifecycle(CountDownLatch start, Runnable operation)
+            throws InterruptedException
+    {
+        assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
+        try {
+            operation.run();
+            return true;
+        }
+        catch (StoreException failure) {
+            assertThat(failure.code()).isEqualTo(STALE_GENERATION);
+            return false;
+        }
+    }
+
+    @Test
     void backendConfigurationAndProcessIdentityAreImmutable()
     {
         BackendRef original = first.getBackend("blue").orElseThrow();
@@ -384,8 +437,7 @@ class TestTransactionStore
         Admission start = startTransaction("transaction", "start");
         Admission commit = second.admitTransaction("transaction", "owner");
         second.recordResponse(commit.id(), new ResponseObservation("commit", null, true, true, 0));
-        long generation = first.beginDrain("blue").generation();
-        first.seal("blue", generation);
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
         BackendRef old = first.getBackend("blue").orElseThrow();
         BackendRef replacement = replacement(old, "new-process");
         var replaced = second.reincarnate("blue", old.incarnation(), generation, replacement);
@@ -410,9 +462,9 @@ class TestTransactionStore
         BackendRef old = first.getBackend("blue").orElseThrow();
         BackendRef replacement = replacement(old, "new-process");
         expect(NOT_DRAINED, () -> first.reincarnate("blue", old.incarnation(), 0, replacement));
-        long generation = first.beginDrain("blue").generation();
-        expect(NOT_DRAINED, () -> first.reincarnate("blue", old.incarnation(), generation, replacement));
-        first.seal("blue", generation);
+        long draining = first.beginDrain("blue").generation();
+        expect(NOT_DRAINED, () -> first.reincarnate("blue", old.incarnation(), draining, replacement));
+        long generation = first.seal("blue", draining).generation();
         expect(STALE_GENERATION, () -> first.reincarnate("blue", UUID.randomUUID(), generation, replacement));
         expect(STALE_GENERATION, () -> first.reincarnate("blue", old.incarnation(), generation - 1, replacement));
         var replaced = first.reincarnate("blue", old.incarnation(), generation, replacement);
@@ -426,8 +478,7 @@ class TestTransactionStore
     void replacementRejectsSameProcessAndActiveAliasesAtomically()
     {
         BackendRef old = first.getBackend("blue").orElseThrow();
-        long generation = first.beginDrain("blue").generation();
-        first.seal("blue", generation);
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
         expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, replacement(old, old.coordinatorId())));
         BackendRef green = first.getBackend("green").orElseThrow();
         BackendRef alias = new BackendRef("blue", UUID.randomUUID(), green.url(), old.externalUrl(), "group", old.nodeId(), "new-process");
@@ -443,8 +494,7 @@ class TestTransactionStore
     {
         first.setRoute("group", "blue");
         BackendRef old = first.getBackend("blue").orElseThrow();
-        long generation = first.beginDrain("blue").generation();
-        first.seal("blue", generation);
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
         expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, replacement(old, "new-process")));
         first.setRoute("group", "green");
         assertThat(first.reincarnate("blue", old.incarnation(), generation, replacement(old, "new-process")).state()).isEqualTo("DRAINING");
@@ -460,8 +510,7 @@ class TestTransactionStore
             BackendRef old = first.getBackend(name).orElseThrow();
             Admission query = first.admitNew(name, "owner", "group");
             first.recordResponse(query.id(), new ResponseObservation("cycle-" + cycle, null, false, true, 0));
-            long generation = first.beginDrain(name).generation();
-            first.seal(name, generation);
+            long generation = first.seal(name, first.beginDrain(name).generation()).generation();
             var replaced = first.reincarnate(name, old.incarnation(), generation, replacement(old, "process-" + cycle));
             assertThat(replaced.generation()).isGreaterThan(generation);
             if (name.equals("blue")) {
@@ -519,8 +568,7 @@ class TestTransactionStore
         BackendRef old = first.getBackend("blue").orElseThrow();
         Admission query = first.admitNew("blue", "owner", "group");
         first.recordResponse(query.id(), new ResponseObservation("old-query", null, false, true, 0));
-        long generation = first.beginDrain("blue").generation();
-        first.seal("blue", generation);
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
         CountDownLatch start = new CountDownLatch(1);
         try (var executor = Executors.newFixedThreadPool(3)) {
             var replacementOne = executor.submit(() -> attemptReplacement(start, old, generation, "replacement-one"));
@@ -655,8 +703,7 @@ class TestTransactionStore
         String hash = "a".repeat(64);
         Admission initial = first.admitNew("blue", "owner", "group");
         first.recordResponse(initial.id(), new ResponseObservation("query", null, false, true, 0, List.of(hash)));
-        long generation = first.beginDrain("blue").generation();
-        first.seal("blue", generation);
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
         var replaced = first.reincarnate("blue", initial.backend().incarnation(), generation, replacement(initial.backend(), "new-process"));
         first.resume("blue", replaced.generation());
         expect(SEALED, () -> second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(hash)));

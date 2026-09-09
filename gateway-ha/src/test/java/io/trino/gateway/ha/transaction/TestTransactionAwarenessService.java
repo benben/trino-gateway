@@ -55,6 +55,7 @@ import java.util.UUID;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -117,6 +118,26 @@ class TestTransactionAwarenessService
         verify(store).markUncertain(any(UUID.class));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"{}", "{\"state\":null}", "{\"state\":1}", "{\"state\":\"RUNNING\"}", "{\"state\":\"QUEUED\"}", "{\"state\":\"FINISHING\"}", "{\"state\":\"UNKNOWN\"}"})
+    void absentContinuationRequiresTerminalQueryState(String stats)
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        String body = "{\"id\":\"" + QUERY + "\",\"stats\":" + stats + "}";
+        expectStatus(502, () -> service.recordResponse(request, response(200, body, "X-Trino-Clear-Transaction-Id", "true")));
+        verifyNoInteractions(store);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"FINISHED", "FAILED"})
+    void validTerminalStatesSettleQueryWithoutInferringTransactionClosure(String state)
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        String body = "{\"id\":\"" + QUERY + "\",\"stats\":{\"state\":\"" + state + "\"}}";
+        service.recordResponse(request, response(200, body));
+        verify(store).recordResponse(admission(request).id(), new ResponseObservation(QUERY, null, false, true, 120));
+    }
+
     @Test
     void unsupportedEncodedResponseCannotSettleAdmission()
     {
@@ -124,6 +145,23 @@ class TestTransactionAwarenessService
         String body = RESULTS.substring(0, RESULTS.length() - 1) + ",\"data\":{\"encoding\":\"json+zstd\",\"segments\":[]}}";
         expectStatus(502, () -> service.recordResponse(request, response(200, body)));
         verifyNoInteractions(store);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{},\"nextUri\":\"http://blue.example.test/v1/statement/executing/20260909_120000_00001_abcde/capability/1\",\"nextUri\":null}",
+            "{\"id\":\"20260909_120000_00002_abcde\",\"id\":\"20260909_120000_00001_abcde\",\"stats\":{}}",
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":null,\"stats\":{}}",
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{},\"partialCancelUri\":\"http://blue.example.test/v1/statement/executing/partialCancel/20260909_120000_00001_abcde/1/capability/1\",\"partialCancelUri\":null}",
+    })
+    void duplicateResultFieldsCannotSettleAdmissionOrRecordCapabilities(String body)
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        assertSoftly(softly -> {
+            softly.assertThatThrownBy(() -> service.recordResponse(request, response(200, body, "X-Trino-Clear-Transaction-Id", "true")))
+                    .isInstanceOfSatisfying(WebApplicationException.class, failure -> assertThat(failure.getResponse().getStatus()).isEqualTo(502));
+            softly.assertThatCode(() -> verifyNoInteractions(store)).doesNotThrowAnyException();
+        });
     }
 
     @Test
@@ -450,7 +488,7 @@ class TestTransactionAwarenessService
     {
         HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, null);
         String next = CONTINUATION.replace("/1", "/2");
-        String cancel = "/v1/statement/executing/" + QUERY + "/cancel/partial/1";
+        String cancel = "/v1/statement/executing/partialCancel/" + QUERY + "/1/capability/1";
         String body = RESULTS.substring(0, RESULTS.length() - 1) + ",\"nextUri\":\"https://gateway.example.test" + next + "?maxWait=1s\",\"partialCancelUri\":\"http://blue.example.test" + cancel + "\"}";
         ProxyResponse response = response(200, body);
         assertThat(service.recordResponse(request, response)).isSameAs(response);

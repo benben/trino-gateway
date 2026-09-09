@@ -48,6 +48,15 @@ class FaultContract(GatewayFixture):
     def test_conflicting_start_response_headers_fail_closed(self):
         self.check_ambiguous_start("conflict")
 
+    def test_duplicate_next_uri_cannot_mark_query_terminal(self):
+        self.configure(0, duplicate_next_uri=True)
+        initial = self.submit("SELECT 1")
+        self.assertEqual(initial.status, 200, initial.body)
+        before = self.pending_count()
+        response = request(through_gateway(initial.json()["nextUri"], self.gateways[1]))
+        self.assertIn(response.status, (502, 503), response.body)
+        self.assert_new_uncertainty(before)
+
     def test_duplicate_start_response_headers_fail_closed(self):
         self.check_ambiguous_start("same")
 

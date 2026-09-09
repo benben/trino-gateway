@@ -129,7 +129,7 @@ class GatewayFixture(unittest.TestCase):
                            hold_start=False, hold_poll=False, duplicate_start_headers=None,
                            force_transaction_id=None, query_error=False, fail_commit=False,
                            lowercase_headers=False, malformed_terminal=False,
-                           terminal_padding_bytes=0, terminal_trailing_bytes=False, initial_status=200,
+                           terminal_padding_bytes=0, terminal_trailing_bytes=False, duplicate_next_uri=False, initial_status=200,
                            drop_start_response=False, drop_poll_response=False)
 
     def tearDown(self):
@@ -138,7 +138,7 @@ class GatewayFixture(unittest.TestCase):
             self.configure(index, query_error=False, fail_commit=False,
                            drop_start_response=False, drop_poll_response=False,
                            malformed_terminal=False, terminal_padding_bytes=0,
-                           terminal_trailing_bytes=False, initial_status=200)
+                           terminal_trailing_bytes=False, duplicate_next_uri=False, initial_status=200)
         for transaction in self.transactions:
             try:
                 finish(self.submit("ROLLBACK", transaction), self.gateways[0])

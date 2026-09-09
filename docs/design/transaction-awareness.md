@@ -71,7 +71,10 @@ principals, UI cookies, and decoded JWT claims must not be assumed verified.
 
 Continuation GET/HEAD/DELETE requests can omit Authorization according to the client
 protocol. Preserve the original query binding and the exact opaque continuation
-path; let the backend validate its capability. A bare query ID is not equivalent
+path. Persist advertised `nextUri` and `partialCancelUri` path hashes atomically
+with the response observation, before exposing the response. Check that a path
+was advertised for the bound query before admission or backend dispatch. The
+backend still validates its capability. A bare query ID is not equivalent
 to a continuation capability. If a continuation supplies credentials or a
 transaction ID, contradictory ownership must fail closed. Do not synthesize
 missing credentials, reveal the binding, or route to another backend on denial.
@@ -96,6 +99,7 @@ The following are semantic records, not a promise of finalized table names:
 | Backend incarnation | Immutable identifier, exact destination and external URL, logical backend name, routing group, ACTIVE/DRAINING/SEALED state and monotonically increasing generation |
 | Transaction binding | Transaction ID, owner binding, backend incarnation, monotonic state and reconciliation metadata |
 | Query binding | Query ID, owner binding, backend incarnation, optional transaction ID, execution/result state and replay-retention metadata |
+| Result capability | Query ID and SHA-256 of an advertised canonical continuation or partial-cancellation path |
 | Admission obligation | A statement selected for a backend that has not yet been conclusively bound to a query or rejected before acceptance |
 
 Every forwarded protocol request, including continuation GET, HEAD and DELETE, creates an
@@ -156,7 +160,7 @@ obligations remain. Report `drained` only after an explicit seal operation locks
 the same backend row, rechecks all obligations, and commits SEALED. A sealed
 backend rejects late continuation admission as well as new statements. This
 prevents a late GET racing between a zero-count observation and backend teardown.
-Seal and resume require the caller's expected generation. Drain and resume advance
+Seal and resume require the caller's expected generation. Drain, seal and resume advance
 the generation. Resuming the same incarnation does not discard old obligations
 or reset transaction tombstones. Responses to already admitted requests remain
 recordable across drain/resume transitions; generation changes fence lifecycle
@@ -175,6 +179,10 @@ state before exposing those headers or a new query continuation to the client.
 Header names are case-insensitive. Reject duplicate or contradictory ownership
 signals rather than selecting an arbitrary value. Do not infer commit or rollback
 success solely from SQL text or an HTTP 200 status.
+Reject duplicate JSON fields and trailing JSON tokens before recording state.
+An ambiguous body must not hide a continuation or signal terminal completion.
+Without a continuation, `stats.state` must be FINISHED or FAILED, as in Trino 483.
+A FINISHED response can still carry a continuation for remaining results.
 The presence of the clear header signals clearing; its value is not a transaction ID. Resolve its
 transaction through the admission or query binding. A start response also binds
 its query to the newly created transaction, even though the original request had

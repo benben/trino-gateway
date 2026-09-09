@@ -111,10 +111,15 @@ Run irreversible fault tests after all normal suites, preferably with a fresh fi
 
 ```sh
 python3 -m unittest -v test_faults.DatabaseFaultContract
+python3 -m unittest -v test_partial_cancel
 python3 -m unittest -v test_faults.FaultContract
 ```
 
 These suites require explicit fault opt-in. Their assertions compare obligation counts before and after each injected fault. Existing uncertain rows cannot substitute for evidence that the new fault was tracked. A PostgreSQL outage affects every fixture Gateway, so no other suite may run concurrently against that lab.
+
+`test_partial_cancel` uses the optional fake `partial_cancel` setting to advertise Trino's stage-cancellation URI shape. DELETE must remain on the original owner after cutover. A 204 response does not prove query or transaction completion. These tests deliberately retain uncertain admissions and must precede the coordinator-restart test. They do not replace cancellation against real Trino.
+
+The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields: a URL followed by `null`. Rejection must preserve uncertainty instead of making the query appear complete.
 
 ## Limits of this suite
 

@@ -288,7 +288,7 @@ public final class TransactionStore
                 return before;
             }
             check(before.readyToSeal(), ErrorCode.NOT_DRAINED, "Backend still has work or is not draining");
-            handle.createUpdate("UPDATE transaction_backend SET state = 'SEALED' WHERE incarnation = :id").bind("id", backend.incarnation()).execute();
+            handle.createUpdate("UPDATE transaction_backend SET state = 'SEALED', generation = generation + 1 WHERE incarnation = :id").bind("id", backend.incarnation()).execute();
             return status(handle, backend);
         });
     }
