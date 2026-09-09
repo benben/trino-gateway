@@ -106,6 +106,25 @@ Names such as blue and green can be reused for later deployments, but an old
 incarnation must never be repointed to a new coordinator. Updating or deleting an
 incarnation with live obligations must fail. Reactivation must not erase those
 obligations or bypass an in-progress retirement operation.
+The implementation rejects multiple current backend names for the same endpoint
+or observed process. It does not support independent alias ledgers. Incarnation
+records remain immutable after sealing. Explicit reincarnation changes only the
+logical name's current-incarnation pointer and preserves all historical bindings.
+It requires the expected incarnation and generation, SEALED state, zero remaining
+obligations, a different observed process, and no route pointing to the old slot.
+The replacement starts DRAINING with a generation greater than the old incarnation.
+An explicit resume makes it eligible for new statements. Old query and admission
+operations still lock their historical incarnation, so they cannot reach a newly
+started coordinator at the same URL. Stale seal, resume, and replacement requests
+must not affect the replacement. This permits repeated blue/green deployment
+cycles without deleting transaction tombstones or reassigning old query IDs.
+
+Where the supported coordinator exposes `nodeId` and `coordinatorId`, bind both
+to the registered incarnation and reject a mismatch. They detect ordinary
+same-address restarts but do not provide a cryptographic process identity:
+coordinator IDs have a finite collision space, and a process can restart between
+a health check and request dispatch. Validate response query identity as well.
+Do not describe an internal ledger UUID as proof that the remote process survived.
 
 The minimum store interface should express atomic operations, not independent
 read-then-write decisions:
@@ -250,6 +269,21 @@ sleep timing. Failure tests must assert both the response and durable state, plu
 the number and destination of backend submissions. The lab must use disposable
 resources and synthetic identities. A passing lab is not authorization to package
 or roll out the feature to production.
+
+### PostgreSQL store tests
+
+Run the focused store suite with a Docker-compatible Testcontainers runtime:
+
+```sh
+./mvnw -pl gateway-ha -am -Dtest=TestTransactionStore -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Alternatively, supply `TX_STORE_TEST_JDBC_URL`, `TX_STORE_TEST_USERNAME`, and
+optionally `TX_STORE_TEST_PASSWORD` for a disposable PostgreSQL instance. The
+suite creates a randomly named private test schema and removes that schema after
+the run. Never point these variables at a production database. The tests use
+separate store instances and real database transactions; they complement, not
+replace, the multi-process Gateway and real-Trino protocol suites.
 
 ## Existing extension boundaries
 

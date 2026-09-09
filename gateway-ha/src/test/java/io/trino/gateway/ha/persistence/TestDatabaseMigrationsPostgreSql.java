@@ -52,4 +52,28 @@ final class TestDatabaseMigrationsPostgreSql
         jdbiHandle.execute(queryHistoryTable);
         jdbiHandle.close();
     }
+
+    @Override
+    protected void verifyGatewaySchema()
+    {
+        super.verifyGatewaySchema();
+        verifyResultSetCount("SELECT name FROM transaction_backend", 0);
+        verifyResultSetCount("SELECT transaction_id FROM transaction_binding", 0);
+        verifyResultSetCount("SELECT query_id FROM transaction_query", 0);
+        verifyResultSetCount("SELECT admission_id FROM transaction_admission", 0);
+        verifyResultSetCount("SELECT routing_group FROM transaction_route", 0);
+    }
+
+    @Override
+    protected void dropAllTables()
+    {
+        jdbi.useHandle(handle -> {
+            handle.execute("DROP TABLE transaction_route");
+            handle.execute("DROP TABLE transaction_admission");
+            handle.execute("DROP TABLE transaction_query");
+            handle.execute("DROP TABLE transaction_binding");
+            handle.execute("DROP TABLE transaction_backend");
+        });
+        super.dropAllTables();
+    }
 }
