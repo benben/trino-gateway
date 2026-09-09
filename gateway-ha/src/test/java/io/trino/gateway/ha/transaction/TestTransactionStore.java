@@ -31,11 +31,14 @@ import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.CONFLICT;
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.NOT_ACTIVE;
@@ -86,7 +89,7 @@ class TestTransactionStore
         admin.useHandle(handle -> handle.execute("CREATE SCHEMA " + schema));
         schemaCreated = true;
         database = Jdbi.create(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema, username, password);
-        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql"}) {
+        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
                 database.useHandle(handle -> handle.createScript(sql).execute());
@@ -114,7 +117,7 @@ class TestTransactionStore
     @BeforeEach
     void resetLedger()
     {
-        database.useHandle(handle -> handle.execute("TRUNCATE transaction_route, transaction_admission, transaction_query, transaction_binding, transaction_backend"));
+        database.useHandle(handle -> handle.execute("TRUNCATE transaction_route, transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend"));
         first.ensureBackend("blue", "http://blue.example.test", "http://blue.example.test", "group", "blue-node", "blue-process");
         first.ensureBackend("green", "http://green.example.test", "http://green.example.test", "group", "green-node", "green-process");
     }
@@ -216,6 +219,24 @@ class TestTransactionStore
         second.markUncertain(admission.id());
         assertThat(first.drainStatus("blue").pendingRequests()).isZero();
         expect(CONFLICT, () -> first.recordResponse(admission.id(), new ResponseObservation("late", null, false, true, 0)));
+    }
+
+    @Test
+    void rejectedContinuationDoesNotEraseQueryOrTransactionObligations()
+    {
+        Admission start = first.admitNew("blue", "owner", "group");
+        first.recordResponse(start.id(), new ResponseObservation("start", "transaction", false, false, 0));
+        Admission continuation = second.admitQuery("start", Optional.of("owner"), Optional.of("transaction"));
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+        first.rejectAdmission(continuation.id());
+        var status = second.beginDrain("blue");
+        assertThat(status.pendingRequests()).isZero();
+        assertThat(status.openTransactions()).isEqualTo(1);
+        assertThat(status.activeQueries()).isEqualTo(1);
+        assertThat(status.readyToSeal()).isFalse();
+        assertThat(first.getQuery("start").orElseThrow().terminal()).isFalse();
+        assertThat(first.getTransaction("transaction").orElseThrow().state()).isEqualTo("OPEN");
+        expect(NOT_DRAINED, () -> second.seal("blue", status.generation()));
     }
 
     @Test
@@ -535,6 +556,174 @@ class TestTransactionStore
     private String queryId(UUID admissionId)
     {
         return database.withHandle(handle -> handle.createQuery("SELECT query_id FROM transaction_admission WHERE admission_id = :id").bind("id", admissionId).mapTo(String.class).one());
+    }
+
+    @Test
+    void advertisedCapabilityPersistsAcrossStoreInstances()
+    {
+        String hash = "a".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0, List.of(hash)));
+        assertThat(capabilities("query")).containsExactly(hash);
+        Admission continuation = second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(hash));
+        assertThat(continuation.ownerHash()).isEqualTo("owner");
+        assertThat(continuation.backend().incarnation()).isEqualTo(initial.backend().incarnation());
+    }
+
+    @Test
+    void wrongOrCrossQueryCapabilitiesCannotCreateAdmissions()
+    {
+        String firstHash = "a".repeat(64);
+        String secondHash = "b".repeat(64);
+        Admission one = first.admitNew("blue", "owner", "group");
+        Admission two = first.admitNew("blue", "owner", "group");
+        first.recordResponse(one.id(), new ResponseObservation("one", null, false, false, 0, List.of(firstHash)));
+        first.recordResponse(two.id(), new ResponseObservation("two", null, false, false, 0, List.of(secondHash)));
+        expect(NOT_FOUND, () -> second.admitQuery("one", Optional.empty(), Optional.empty(), Optional.of(secondHash)));
+        expect(NOT_FOUND, () -> second.admitQuery("one", Optional.empty(), Optional.empty(), Optional.of("c".repeat(64))));
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        assertThat(first.drainStatus("blue").activeQueries()).isEqualTo(2);
+    }
+
+    @Test
+    void completedCallbackCannotPublishDifferentCapabilities()
+    {
+        String firstHash = "a".repeat(64);
+        String changedHash = "b".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0, List.of(firstHash)));
+        expect(CONFLICT, () -> second.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0, List.of(changedHash))));
+        assertThat(capabilities("query")).containsExactly(firstHash);
+    }
+
+    @Test
+    void capabilityCollectionIsImmutableAndCanonicalForReplays()
+    {
+        String firstHash = "a".repeat(64);
+        String secondHash = "b".repeat(64);
+        List<String> supplied = new ArrayList<>(List.of(secondHash, firstHash, secondHash));
+        ResponseObservation observation = new ResponseObservation("query", null, false, false, 0, supplied);
+        supplied.clear();
+        assertThat(observation.capabilityHashes()).containsExactly(firstHash, secondHash);
+        assertThatThrownBy(() -> observation.capabilityHashes().add("c".repeat(64))).isInstanceOf(UnsupportedOperationException.class);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), observation);
+        second.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0, List.of(firstHash, secondHash)));
+        assertThat(capabilities("query")).containsExactly(firstHash, secondHash);
+    }
+
+    @Test
+    void responseConflictRollsBackCapabilitiesAndQueryBinding()
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        expect(CONFLICT, () -> first.recordResponse(initial.id(), new ResponseObservation("query", null, true, false, 0, List.of("a".repeat(64)))));
+        assertThat(first.getQuery("query")).isEmpty();
+        assertThat(capabilities("query")).isEmpty();
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void laterObservationsRetainPreviousCapabilitiesAndBindLateTransactions()
+    {
+        String firstHash = "a".repeat(64);
+        String secondHash = "b".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0, List.of(firstHash)));
+        Admission continuation = second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(firstHash));
+        second.recordResponse(continuation.id(), new ResponseObservation("query", "transaction", false, false, 0, List.of(secondHash)));
+        assertThat(capabilities("query")).containsExactly(firstHash, secondHash);
+        assertThat(first.getTransaction("transaction").orElseThrow().state()).isEqualTo("OPEN");
+        assertThat(first.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(firstHash)).transactionId()).isEqualTo("transaction");
+        assertThat(second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(secondHash)).transactionId()).isEqualTo("transaction");
+    }
+
+    @Test
+    void malformedCapabilityHashesCannotPartiallyRecordResponses()
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        for (String hash : List.of("", "a".repeat(63), "a".repeat(65), "g".repeat(64), "A".repeat(64))) {
+            expect(CONFLICT, () -> first.recordResponse(initial.id(), new ResponseObservation("query", "transaction", false, false, 0, List.of(hash))));
+        }
+        assertThat(first.getQuery("query")).isEmpty();
+        assertThat(first.getTransaction("transaction")).isEmpty();
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void recordedCapabilityCannotBypassHistoricalSealedIncarnation()
+    {
+        String hash = "a".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, true, 0, List.of(hash)));
+        long generation = first.beginDrain("blue").generation();
+        first.seal("blue", generation);
+        var replaced = first.reincarnate("blue", initial.backend().incarnation(), generation, replacement(initial.backend(), "new-process"));
+        first.resume("blue", replaced.generation());
+        expect(SEALED, () -> second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(hash)));
+        assertThat(capabilities("query")).containsExactly(hash);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void capabilityCheckWaitsForAtomicPublicationUnderBackendFence()
+            throws Exception
+    {
+        String hash = "a".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0));
+        try (var executor = Executors.newSingleThreadExecutor(); Handle fence = database.open()) {
+            fence.begin();
+            fence.createQuery("SELECT name FROM transaction_backend WHERE incarnation = :id FOR UPDATE")
+                    .bind("id", initial.backend().incarnation()).mapTo(String.class).one();
+            CountDownLatch started = new CountDownLatch(1);
+            var continuation = executor.submit(() -> {
+                started.countDown();
+                return second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(hash));
+            });
+            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> continuation.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+            fence.createUpdate("INSERT INTO transaction_query_capability (query_id, capability_hash) VALUES ('query', :hash)")
+                    .bind("hash", hash).execute();
+            fence.commit();
+            assertThat(continuation.get(5, TimeUnit.SECONDS).queryId()).isEqualTo("query");
+        }
+    }
+
+    @Test
+    void legacyQueryWithoutRecordedCapabilitiesFailsClosed()
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("legacy", null, false, false, 0));
+        expect(NOT_FOUND, () -> second.admitQuery("legacy", Optional.empty(), Optional.empty(), Optional.of("a".repeat(64))));
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        first.recordResponse(initial.id(), new ResponseObservation("legacy", null, false, false, 0));
+        assertThat(second.admitQuery("legacy", Optional.of("owner"), Optional.empty()).queryId()).isEqualTo("legacy");
+    }
+
+    @Test
+    void databaseFailureDuringCapabilityPublicationRollsBackEntireObservation()
+    {
+        String firstHash = "a".repeat(64);
+        String rejectedHash = "b".repeat(64);
+        Admission initial = first.admitNew("blue", "owner", "group");
+        database.useHandle(handle -> handle.execute("ALTER TABLE transaction_query_capability ADD CONSTRAINT test_capability_failure CHECK (capability_hash <> repeat('b', 64))"));
+        try {
+            assertThatThrownBy(() -> first.recordResponse(initial.id(), new ResponseObservation("query", "transaction", false, false, 0, List.of(firstHash, rejectedHash))))
+                    .isInstanceOf(RuntimeException.class).hasMessageContaining("test_capability_failure");
+            assertThat(first.getQuery("query")).isEmpty();
+            assertThat(first.getTransaction("transaction")).isEmpty();
+            assertThat(capabilities("query")).isEmpty();
+            assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+        }
+        finally {
+            database.useHandle(handle -> handle.execute("ALTER TABLE transaction_query_capability DROP CONSTRAINT test_capability_failure"));
+        }
+    }
+
+    private List<String> capabilities(String queryId)
+    {
+        return database.withHandle(handle -> handle.createQuery("SELECT capability_hash FROM transaction_query_capability WHERE query_id = :query ORDER BY capability_hash")
+                .bind("query", queryId).mapTo(String.class).list());
     }
 
     private static BackendRef replacement(BackendRef old, String coordinatorId)

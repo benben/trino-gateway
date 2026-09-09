@@ -32,6 +32,12 @@ Canonical protocol paths are required; alternate encoded, matrix-parameter,
 dot-segment and repeated-slash path spellings are rejected. Query-string values
 are not subject to this path restriction.
 
+Result and cancellation paths are capabilities. Before exposing `nextUri` or
+`partialCancelUri`, Gateway stores its path hash with query ownership in the same
+database transaction. A continuation must match an advertised capability; a query
+ID alone is insufficient. Metadata requests without a capability require the
+owner's Basic credentials. These checks do not depend on a replica-local cache.
+
 Existing backend registration still uses Gateway's normal API. Once enabled,
 legacy activation/deactivation, destination changes, and deletion cannot bypass
 the durable transaction controls. A new backend must expose a ready coordinator
@@ -68,6 +74,11 @@ historical bindings and creates a new DRAINING incarnation. Resume that returned
 generation before making the slot a destination again. Old query IDs never bind
 to the replacement. All feature-enabled replicas must understand incarnation
 history before this operation; mixed unreleased V5/V6 prototypes are unsupported.
+
+The V7 capability migration cannot reconstruct result URLs issued by earlier
+unreleased prototypes. Finish those queries before upgrading all replicas to V7;
+old result paths fail closed. This prototype upgrade restriction does not apply
+to a V7-to-V7 Gateway restart, which preserves the database and shared keys.
 
 ## Failure boundaries
 

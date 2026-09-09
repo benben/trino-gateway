@@ -23,6 +23,7 @@ import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Request;
@@ -99,6 +100,9 @@ public class GatewayResource
 
     private Response throwError(Exception e)
     {
+        if (e instanceof WebApplicationException webException) {
+            return webException.getResponse();
+        }
         return Response.status(Response.Status.NOT_FOUND)
                 .entity(e.getMessage())
                 .type("text/plain")

@@ -26,8 +26,10 @@ import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
 import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
+import io.trino.gateway.ha.transaction.TransactionStore.ErrorCode;
 import io.trino.gateway.ha.transaction.TransactionStore.QueryBinding;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
+import io.trino.gateway.ha.transaction.TransactionStore.StoreException;
 import io.trino.gateway.ha.transaction.TransactionStore.TransactionBinding;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import jakarta.servlet.http.HttpServletRequest;
@@ -209,7 +211,7 @@ class TestTransactionAwarenessService
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {204, 400, 404, 409, 429, 500, 503})
+    @ValueSource(ints = {204, 400, 409, 429, 500, 503})
     void unprovenNonSuccessResponsesRemainUncertain(int status)
     {
         HttpServletRequest request = admitted("DELETE", CONTINUATION, QUERY, null);
@@ -230,6 +232,41 @@ class TestTransactionAwarenessService
         service.recordResponse(request, response(status, "authentication rejected"));
         verify(store).rejectAdmission(admission.id());
         verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void rejectedCapabilitySettlesTransportWithoutCompletingQuery(String method)
+    {
+        HttpServletRequest request = admitted(method, CONTINUATION, QUERY, TRANSACTION);
+        Admission admission = admission(request);
+        ProxyResponse rejected = response(404, "Query not found");
+        assertThat(service.recordResponse(request, rejected)).isSameAs(rejected);
+        verify(store).rejectAdmission(admission.id());
+        verify(store, never()).markUncertain(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void rejectedCapabilityWithLifecycleSignalRemainsUncertain(String method)
+    {
+        HttpServletRequest request = admitted(method, CONTINUATION, QUERY, TRANSACTION);
+        Admission admission = admission(request);
+        service.recordResponse(request, response(404, "Query not found", "X-Trino-Started-Transaction-Id", TRANSACTION));
+        verify(store).markUncertain(admission.id());
+        verify(store, never()).rejectAdmission(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @Test
+    void statementNotFoundRemainsUncertain()
+    {
+        HttpServletRequest request = admitted("POST", "/v1/statement", null, null);
+        Admission admission = admission(request);
+        service.recordResponse(request, response(404, "Query not found"));
+        verify(store).markUncertain(admission.id());
+        verify(store, never()).rejectAdmission(any());
     }
 
     @Test
@@ -333,7 +370,7 @@ class TestTransactionAwarenessService
                 request,
                 () -> { throw new AssertionError("Known query must not use ordinary routing"); },
                 _ -> { throw new AssertionError("Known query must not select a new backend"); }));
-        verify(store, never()).admitQuery(anyString(), any(), any());
+        verify(store, never()).admitQuery(anyString(), any(), any(), any());
         verifyNoInteractions(httpClient);
     }
 
@@ -349,14 +386,118 @@ class TestTransactionAwarenessService
                 _ -> { throw new AssertionError("Known query must not select a new backend"); });
         assertThat(admission(response.modifiedRequest())).isEqualTo(admission);
         assertThat(response.routingDestination().clusterHost()).isEqualTo(BACKEND.url());
-        verify(store).admitQuery(QUERY, Optional.of("owner"), Optional.empty());
+        verify(store).admitQuery(QUERY, Optional.of("owner"), Optional.empty(), Optional.of(TransactionAwarenessService.capabilityHash(CONTINUATION)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void unadvertisedCapabilityCannotReachBackend(String method)
+    {
+        configureKnownQuery();
+        String forged = CONTINUATION.replace("capability", "forged");
+        when(store.admitQuery(eq(QUERY), any(), any(), eq(Optional.of(TransactionAwarenessService.capabilityHash(forged)))))
+                .thenThrow(new StoreException(ErrorCode.NOT_FOUND, "Unknown capability"));
+        HttpServletRequest request = request(method, forged, Map.of());
+        expectStatus(404, () -> service.resolve(
+                request,
+                () -> { throw new AssertionError("Capability rejection must not reroute"); },
+                _ -> { throw new AssertionError("Capability rejection must not select a backend"); }));
+        assertThat(admission(request)).isNull();
+        verify(store, never()).admitQuery(anyString(), any(), any());
+        verify(store, never()).admitQuery(anyString(), any(), any(), eq(Optional.empty()));
+        verifyNoInteractions(httpClient, selector, backendManager);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void validCapabilityPreservesOriginalPathAndQueryParameters(String method)
+    {
+        configureKnownQuery();
+        HttpServletRequest request = request(method, CONTINUATION, Map.of());
+        when(request.getQueryString()).thenReturn("maxWait=1s&example=%2Fencoded");
+        RoutingTargetResponse resolved = service.resolve(
+                request,
+                () -> { throw new AssertionError("Known query must not reroute"); },
+                _ -> { throw new AssertionError("Known query must not select a backend"); });
+        assertThat(resolved.modifiedRequest().getRequestURI()).isEqualTo(CONTINUATION);
+        assertThat(resolved.modifiedRequest().getQueryString()).isEqualTo(request.getQueryString());
+        assertThat(resolved.routingDestination().clusterUri().getRawPath()).isEqualTo(CONTINUATION);
+        assertThat(resolved.routingDestination().clusterUri().getRawQuery()).isEqualTo(request.getQueryString());
+        verify(store).admitQuery(QUERY, Optional.of("owner"), Optional.empty(), Optional.of(TransactionAwarenessService.capabilityHash(CONTINUATION)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void authenticatedMetadataUsesOwnerWithoutResultCapability(String method)
+    {
+        configureKnownQuery();
+        String basic = "Basic " + Base64.getEncoder().encodeToString("alice:synthetic-password".getBytes(UTF_8));
+        HttpServletRequest request = request(method, "/v1/query/" + QUERY, Map.of("Authorization", List.of(basic)));
+        String owner = new TransactionIdentity(configuration.getTransactionAwareness().getIdentityKey()).owner(request);
+        when(store.getQuery(QUERY)).thenReturn(Optional.of(new QueryBinding(QUERY, owner, BACKEND, null, false)));
+        service.resolve(request, () -> { throw new AssertionError("Metadata must not reroute"); }, _ -> { throw new AssertionError("Metadata must not select a backend"); });
+        verify(store).admitQuery(QUERY, Optional.of(owner), Optional.empty(), Optional.empty());
+    }
+
+    @Test
+    void capabilityHashMatchesCanonicalRawPathSha256()
+    {
+        assertThat(TransactionAwarenessService.capabilityHash(CONTINUATION)).isEqualTo("528710e9ad15ed24ba4252d2c744d8fbe2c3818700e5f0d791237d355154bcb6");
+    }
+
+    @Test
+    void advertisedNextAndPartialCancelCapabilitiesShareAtomicObservation()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, null);
+        String next = CONTINUATION.replace("/1", "/2");
+        String cancel = "/v1/statement/executing/" + QUERY + "/cancel/partial/1";
+        String body = RESULTS.substring(0, RESULTS.length() - 1) + ",\"nextUri\":\"https://gateway.example.test" + next + "?maxWait=1s\",\"partialCancelUri\":\"http://blue.example.test" + cancel + "\"}";
+        ProxyResponse response = response(200, body);
+        assertThat(service.recordResponse(request, response)).isSameAs(response);
+        assertThat(response.body()).isEqualTo(body);
+        verify(store).recordResponse(admission(request).id(), new ResponseObservation(
+                QUERY,
+                null,
+                false,
+                false,
+                120,
+                List.of(TransactionAwarenessService.capabilityHash(next), TransactionAwarenessService.capabilityHash(cancel))));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"nextUri", "partialCancelUri"})
+    void invalidAdvertisedCapabilityCannotSettleAnyLifecycle(String field)
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        for (String uri : List.of(
+                "http://blue.example.test" + CONTINUATION.replace(QUERY, "20260909_120000_00002_abcde"),
+                "http://blue.example.test" + CONTINUATION.replace("statement", "%73tatement"),
+                "http://blue.example.test" + CONTINUATION.replace("/executing/", "/./executing/"),
+                "http://blue.example.test" + CONTINUATION + "#fragment",
+                "http://user@blue.example.test" + CONTINUATION,
+                "ftp://blue.example.test" + CONTINUATION,
+                CONTINUATION,
+                "http://[invalid")) {
+            String body = RESULTS.substring(0, RESULTS.length() - 1) + ",\"" + field + "\":\"" + uri + "\"}";
+            expectStatus(502, () -> service.recordResponse(request, response(200, body, "X-Trino-Clear-Transaction-Id", "true")));
+        }
+        verifyNoInteractions(store);
+    }
+
+    @Test
+    void malformedPartialCapabilityCannotPartiallyRecordValidNextCapability()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, null);
+        String body = RESULTS.substring(0, RESULTS.length() - 1) + ",\"nextUri\":\"http://blue.example.test" + CONTINUATION + "\",\"partialCancelUri\":42}";
+        expectStatus(502, () -> service.recordResponse(request, response(200, body)));
+        verifyNoInteractions(store);
     }
 
     private Admission configureKnownQuery()
     {
         Admission admission = new Admission(UUID.randomUUID(), BACKEND, "owner", null, QUERY);
         when(store.getQuery(QUERY)).thenReturn(Optional.of(new QueryBinding(QUERY, "owner", BACKEND, null, false)));
-        when(store.admitQuery(eq(QUERY), any(), any())).thenReturn(admission);
+        when(store.admitQuery(eq(QUERY), any(), any(), any())).thenReturn(admission);
         StringResponse process = mock(StringResponse.class);
         when(process.getStatusCode()).thenReturn(200);
         when(process.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");

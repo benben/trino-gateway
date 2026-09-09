@@ -46,8 +46,11 @@ import org.jdbi.v3.core.Jdbi;
 import java.io.IOException;
 import java.net.URI;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -100,7 +103,7 @@ public class TransactionAwarenessService
     {
         if (isEnabled()) {
             String path = request.getRequestURI();
-            if (path == null || path.contains(";") || path.contains("%") || path.contains("\\") || path.contains("//") || !URI.create(path).normalize().getPath().equals(path)) {
+            if (!canonicalPath(path)) {
                 throw error(400, "Transaction-aware proxy requests require a canonical path");
             }
         }
@@ -157,7 +160,8 @@ public class TransactionAwarenessService
                         .orElseThrow(() -> error(400, "Invalid query continuation path"));
                 QueryBinding query = store.getQuery(queryId).orElseThrow(() -> error(404, "Unknown query identifier"));
                 identity.validateContinuation(request, query.ownerHash());
-                admission = store.admitQuery(queryId, Optional.of(query.ownerHash()), transaction);
+                Optional<String> capability = request.getRequestURI().startsWith("/v1/query/") ? Optional.empty() : Optional.of(capabilityHash(request.getRequestURI()));
+                admission = store.admitQuery(queryId, Optional.of(query.ownerHash()), transaction, capability);
             }
             try {
                 verifyProcess(admission.backend());
@@ -180,6 +184,11 @@ public class TransactionAwarenessService
             return response;
         }
         return guarded(() -> {
+            if (response.statusCode() == 404 && admission.queryId() != null && List.of("GET", "HEAD", "DELETE").contains(request.getMethod()) &&
+                    responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
+                store.rejectAdmission(admission.id());
+                return response;
+            }
             if ((response.statusCode() == 401 || response.statusCode() == 403) &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty() &&
                     !response.body().stripLeading().startsWith("{")) {
@@ -238,22 +247,13 @@ public class TransactionAwarenessService
                 throw error(502, "Backend returned contradictory transaction lifecycle headers");
             }
             boolean terminal = !body.hasNonNull("nextUri");
-            if (!terminal) {
-                if (!body.path("nextUri").isTextual()) {
-                    throw error(502, "Backend returned an invalid continuation");
-                }
-                URI next;
-                try {
-                    next = URI.create(body.path("nextUri").asText());
-                }
-                catch (IllegalArgumentException e) {
-                    throw error(502, "Backend returned an invalid continuation");
-                }
-                if (!List.of("http", "https").contains(next.getScheme()) || !extractQueryIdIfPresent(next.getPath(), null, statementPaths).equals(Optional.of(queryId))) {
-                    throw error(502, "Backend continuation does not match its query");
+            List<String> capabilities = new ArrayList<>();
+            for (String field : List.of("nextUri", "partialCancelUri")) {
+                if (body.hasNonNull(field)) {
+                    capabilities.add(responseCapability(body.path(field), queryId));
                 }
             }
-            store.recordResponse(admission.id(), new ResponseObservation(queryId, started.orElse(null), clear, terminal, config.getTerminalRetentionSeconds()));
+            store.recordResponse(admission.id(), new ResponseObservation(queryId, started.orElse(null), clear, terminal, config.getTerminalRetentionSeconds(), capabilities));
             if (started.isPresent() && !store.getTransaction(started.orElseThrow()).orElseThrow().state().equals("OPEN")) {
                 throw error(409, "A completed transaction cannot be started again by a replayed response");
             }
@@ -414,6 +414,45 @@ public class TransactionAwarenessService
     private static Admission admission(HttpServletRequest request)
     {
         return (Admission) request.getAttribute(ADMISSION_ATTRIBUTE);
+    }
+
+    private String responseCapability(JsonNode value, String queryId)
+    {
+        if (!value.isTextual()) {
+            throw error(502, "Backend returned an invalid result capability");
+        }
+        URI uri;
+        try {
+            uri = URI.create(value.asText());
+        }
+        catch (IllegalArgumentException e) {
+            throw error(502, "Backend returned an invalid result capability");
+        }
+        if (uri.getScheme() == null || !List.of("http", "https").contains(uri.getScheme()) || uri.getHost() == null || uri.getRawUserInfo() != null || uri.getRawFragment() != null ||
+                !canonicalPath(uri.getRawPath()) || !extractQueryIdIfPresent(uri.getRawPath(), null, statementPaths).equals(Optional.of(queryId))) {
+            throw error(502, "Backend result capability does not match its query");
+        }
+        return capabilityHash(uri.getRawPath());
+    }
+
+    private static boolean canonicalPath(String path)
+    {
+        try {
+            return path != null && path.startsWith("/") && !path.contains(";") && !path.contains("%") && !path.contains("\\") && !path.contains("//") && URI.create(path).normalize().getPath().equals(path);
+        }
+        catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    static String capabilityHash(String path)
+    {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(path.getBytes(UTF_8)));
+        }
+        catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     static HttpServletRequest inlineResults(HttpServletRequest request)

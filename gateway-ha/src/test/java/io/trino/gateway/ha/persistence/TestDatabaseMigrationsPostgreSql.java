@@ -60,6 +60,7 @@ final class TestDatabaseMigrationsPostgreSql
         verifyResultSetCount("SELECT name FROM transaction_backend", 0);
         verifyResultSetCount("SELECT transaction_id FROM transaction_binding", 0);
         verifyResultSetCount("SELECT query_id FROM transaction_query", 0);
+        verifyResultSetCount("SELECT query_id FROM transaction_query_capability", 0);
         verifyResultSetCount("SELECT admission_id FROM transaction_admission", 0);
         verifyResultSetCount("SELECT routing_group FROM transaction_route", 0);
     }
@@ -70,6 +71,7 @@ final class TestDatabaseMigrationsPostgreSql
         jdbi.useHandle(handle -> {
             handle.execute("DROP TABLE transaction_route");
             handle.execute("DROP TABLE transaction_admission");
+            handle.execute("DROP TABLE transaction_query_capability");
             handle.execute("DROP TABLE transaction_query");
             handle.execute("DROP TABLE transaction_binding");
             handle.execute("DROP TABLE transaction_backend");

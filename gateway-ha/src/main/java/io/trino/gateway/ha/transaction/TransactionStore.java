@@ -19,6 +19,7 @@ import org.jdbi.v3.core.Jdbi;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,7 +39,18 @@ public final class TransactionStore
 
     public record Admission(UUID id, BackendRef backend, String ownerHash, @Nullable String transactionId, @Nullable String queryId) {}
 
-    public record ResponseObservation(@Nullable String queryId, @Nullable String startedTxId, boolean clear, boolean terminal, int retryWindowSeconds) {}
+    public record ResponseObservation(@Nullable String queryId, @Nullable String startedTxId, boolean clear, boolean terminal, int retryWindowSeconds, List<String> capabilityHashes)
+    {
+        public ResponseObservation
+        {
+            capabilityHashes = List.copyOf(capabilityHashes).stream().distinct().sorted().toList();
+        }
+
+        public ResponseObservation(@Nullable String queryId, @Nullable String startedTxId, boolean clear, boolean terminal, int retryWindowSeconds)
+        {
+            this(queryId, startedTxId, clear, terminal, retryWindowSeconds, List.of());
+        }
+    }
 
     public record QueryBinding(String queryId, String ownerHash, BackendRef backend, @Nullable String transactionId, boolean terminal) {}
 
@@ -146,12 +158,22 @@ public final class TransactionStore
 
     public Admission admitQuery(String queryId, Optional<String> ownerHash, Optional<String> transactionId)
     {
+        return admitQuery(queryId, ownerHash, transactionId, Optional.empty());
+    }
+
+    public Admission admitQuery(String queryId, Optional<String> ownerHash, Optional<String> transactionId, Optional<String> capabilityHash)
+    {
         return jdbi.inTransaction(handle -> {
             QueryBinding initial = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
             BackendRef backend = lockIncarnation(handle, initial.backend().incarnation());
             QueryBinding binding = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
             ownerHash.ifPresent(owner -> checkOwner(binding.ownerHash(), owner));
             transactionId.ifPresent(transaction -> check(transaction.equals(binding.transactionId()), ErrorCode.CONFLICT, "Query and transaction disagree"));
+            capabilityHash.ifPresent(hash -> {
+                check(hash.matches("[0-9a-f]{64}"), ErrorCode.NOT_FOUND, "Unknown query continuation capability");
+                check(handle.createQuery("SELECT EXISTS (SELECT 1 FROM transaction_query_capability WHERE query_id = :query AND capability_hash = :hash)")
+                        .bind("query", queryId).bind("hash", hash).mapTo(Boolean.class).one(), ErrorCode.NOT_FOUND, "Unknown query continuation capability");
+            });
             checkNotSealed(handle, backend);
             return insertAdmission(handle, backend, binding.ownerHash(), binding.transactionId(), queryId);
         });
@@ -161,6 +183,7 @@ public final class TransactionStore
     {
         check(observation.retryWindowSeconds() >= 0, ErrorCode.CONFLICT, "Retry window cannot be negative");
         check(!(observation.clear() && observation.startedTxId() != null), ErrorCode.CONFLICT, "Response both starts and clears a transaction");
+        observation.capabilityHashes().forEach(hash -> check(hash.matches("[0-9a-f]{64}"), ErrorCode.CONFLICT, "Capability must be a lowercase SHA-256 hash"));
         jdbi.useTransaction(handle -> {
             Admission admission = lockAdmissionBackend(handle, admissionId);
             String fingerprint = fingerprint(observation);
@@ -191,6 +214,10 @@ public final class TransactionStore
                 transactionId = observation.startedTxId();
             }
             bindQuery(handle, queryId, admission, transactionId);
+            for (String hash : observation.capabilityHashes()) {
+                handle.createUpdate("INSERT INTO transaction_query_capability (query_id, capability_hash) VALUES (:query, :hash) ON CONFLICT DO NOTHING")
+                        .bind("query", queryId).bind("hash", hash).execute();
+            }
             if (observation.clear()) {
                 check(transactionId != null, ErrorCode.CONFLICT, "Response clears an unknown transaction");
                 TransactionBinding transaction = findTransaction(handle, transactionId).orElseThrow(() -> missing("transaction"));
@@ -510,7 +537,8 @@ public final class TransactionStore
 
     private static String fingerprint(ResponseObservation observation)
     {
-        return encode(observation.queryId()) + encode(observation.startedTxId()) + observation.clear() + ":" + observation.terminal() + ":" + observation.retryWindowSeconds();
+        String fingerprint = encode(observation.queryId()) + encode(observation.startedTxId()) + observation.clear() + ":" + observation.terminal() + ":" + observation.retryWindowSeconds();
+        return observation.capabilityHashes().isEmpty() ? fingerprint : fingerprint + ":capabilities:" + String.join(",", observation.capabilityHashes());
     }
 
     private static String encode(@Nullable String value)
