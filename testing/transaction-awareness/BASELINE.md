@@ -1,0 +1,43 @@
+# Upstream regression checkpoint
+
+Date: 2026-09-09. This is a deliberately failing regression checkpoint, not a completed implementation or production acceptance report.
+
+The protocol fixture and black-box suite were introduced before any transaction-awareness Java changes. The tested application was the upstream Gateway 21 container. The lab used two separate Gateway processes, one shared PostgreSQL instance, and two independent fake Trino backends. Every resource and query was synthetic. Private runtime addresses and infrastructure details are intentionally omitted.
+
+The source audit found no Java implementation or test changes between Gateway tag `21` and source commit `9b0e9038e87be1f600dc40d8c8bf1d09dd509491`. That source's existing six routing/proxy test classes also passed: 83 tests, zero failures, errors or skips. That Maven run skipped frontend and build-quality plugins; it was not a full upstream verification run.
+
+## Executed black-box proof
+
+Fixture self-tests: six passed. After the fixture's existing health-monitor configuration was shortened for test readiness, this combined command ran against both independent Gateway process endpoints:
+
+```sh
+python3 -m unittest -v \
+  test_gateway.BaselineControls \
+  test_gateway.TransactionContract.test_transaction_stays_on_owner_after_cutover \
+  test_gateway.TransactionContract.test_unknown_id_is_rejected_before_backend
+```
+
+Result: five tests in 48.725 seconds; three baseline controls passed and both new contract assertions failed. No expected-failure annotations or skipped assertions were used.
+
+| Assertion | Actual upstream result |
+| --- | --- |
+| Query and continuation across independent Gateway processes | Passed |
+| Terminal poll replay through another Gateway process | Passed |
+| Start, query and rollback without a backend switch | Passed |
+| Transaction remains on its original backend after activation switches | Failed: a transaction created on blue reached green, which returned `UNKNOWN_TRANSACTION` |
+| Unknown transaction ID is rejected before forwarding | Failed: Gateway forwarded the request and returned HTTP 200 with a query continuation |
+
+An earlier baseline attempt had two setup failures because the test's 30-second readiness deadline was shorter than the upstream default health interval. Those were fixture-timing failures, not transaction regression evidence. The harness now avoids redundant activation and defaults to a 120-second readiness deadline. Baseline controls passed independently after that correction and again in the combined run above.
+
+The complete initial contract then ran with `python3 -m unittest -v test_gateway.TransactionContract`: 18 tests in 194.100 seconds. All 18 failed their contract assertions; unittest reported 19 failure entries because the all-replica test failed separately on both replicas. There were no test errors or skips.
+
+- Five tests exposed incorrect transaction affinity, including commit, rollback and a start header returned on a continuation page.
+- Six tests exposed forwarded unknown, malformed, duplicated or differently owned transaction identities.
+- One test showed that upstream accepted a live backend URL replacement instead of rejecting it.
+- Six tests failed because the required drain, seal or atomic-cutover API was absent (HTTP 404).
+
+The missing-API failures establish incomplete feature coverage; the misrouting and forwarding failures establish the existing behavioral gap. All baseline and initial contract tests completed before transaction-awareness Java implementation began.
+
+## Interpretation
+
+This proves that existing query-ID routing works in the lab while the two new transaction guarantees fail on upstream. It does not prove the later implementation, real-client compatibility, fault recovery or safe drain. The full acceptance matrix requires additional positive tests after implementation, including real Trino processes and deliberately forced fault interleavings.

@@ -37,6 +37,7 @@ Register the two fixture backends in the same Gateway routing group. Use distinc
 | `TX_ROUTING_GROUP` | Shared fixture group; defaults to `transaction-test`. |
 | `TX_ADMIN_TOKEN` | Optional API-role bearer token for admin calls. |
 | `TX_QUERY_AUTHORIZATION` | Query authorization header; defaults to synthetic Basic credentials `user:test-password`. |
+| `TX_READINESS_TIMEOUT_SECONDS` | Backend health convergence deadline; defaults to 120 seconds for upstream health polling. |
 
 Keep actual endpoint values, secrets and raw environment output outside the repository. For transaction-aware runs, enable the feature and configure the same randomly generated identity key on every Gateway. See the feature configuration documentation for the key requirements. Do not disable authentication binding to make tests pass.
 

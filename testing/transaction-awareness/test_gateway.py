@@ -82,11 +82,16 @@ class GatewayFixture(unittest.TestCase):
         target = self.names[index]
         old = self.names[1 - index]
         for gateway in range(len(self.gateways)):
+            current = self.admin("/gateway/backend/all", gateway=gateway)
+            self.assertEqual(current.status, 200, current.body)
+            states = {backend["name"]: backend["active"] for backend in current.json()}
             for action, name in (("activate", target), ("deactivate", old)):
+                if states.get(name) == (action == "activate"):
+                    continue
                 response = self.admin("/gateway/backend/" + action + "/" + name, "POST", gateway=gateway)
                 self.assertEqual(response.status, 200, response.body)
         expected = self.state(index)["identity"]
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + float(os.environ.get("TX_READINESS_TIMEOUT_SECONDS", "120"))
         while True:
             try:
                 results = [self.select_backend(gateway=gateway) for gateway in range(len(self.gateways))]
@@ -118,6 +123,12 @@ class GatewayFixture(unittest.TestCase):
                 pass
         self.resume(0)
         self.resume(1)
+        if self.backend_status().status == 404:
+            for index, backend in enumerate(self.backends):
+                outstanding = self.state(index)["transactions"]
+                for transaction in self.transactions:
+                    if transaction in outstanding:
+                        finish(statement(backend, "ROLLBACK", transaction), backend)
 
     def start(self, gateway=0):
         pages = self.complete(self.submit("START TRANSACTION", gateway=gateway), gateway)
@@ -136,12 +147,6 @@ class GatewayFixture(unittest.TestCase):
 
 
 class BaselineControls(GatewayFixture):
-    def tearDown(self):
-        super().tearDown()
-        for transaction in self.transactions:
-            for backend in self.backends:
-                finish(statement(backend, "ROLLBACK", transaction), backend)
-
     def test_query_and_continuation_across_replicas(self):
         first = self.submit("SELECT 1", gateway=0)
         pages = self.complete(first, gateway=1)
