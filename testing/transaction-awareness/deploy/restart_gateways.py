@@ -176,6 +176,11 @@ def main():
         owner = binding(urls[-1], transaction)
         if scalar(urls[-1], "SELECT count(*) FROM tpch.tiny.nation", transaction) != 25:
             raise AssertionError("The transaction baseline result was incorrect")
+        pending_result = statement(urls[0], "SELECT count(*) FROM tpch.tiny.nation", transaction,
+                                   os.environ["TX_TRINO_USER"], group, [("Authorization", authorization)])
+        if pending_result.status != 200 or not pending_result.json().get("nextUri"):
+            raise AssertionError("The restart fixture requires an advertised continuation before replacement")
+        pending_query_id = pending_result.json()["id"]
         close_forwards()
         print("Real transaction is open; replacing all Gateway processes while preserving its private identity.")
         subprocess.run([sys.executable, str(Path(__file__).with_name("lab.py")), "--context", args.context, "--namespace", args.namespace,
@@ -191,6 +196,12 @@ def main():
                     raise
                 time.sleep(1)
         urls = forward(after["pods"])
+        retained_pages = finish(pending_result, urls[-1], limit=200)
+        if any(page.status != 200 or "error" in page.json() or page.json().get("id") != pending_query_id for page in retained_pages):
+            raise AssertionError("The retained query continuation failed after Gateway replacement")
+        retained_rows = [row for page in retained_pages for row in page.json().get("data", [])]
+        if retained_pages[-1].json().get("nextUri") or retained_rows != [[25]]:
+            raise AssertionError("The retained query did not deliver its expected final result")
         for url in urls:
             if binding(url, transaction) != owner:
                 raise AssertionError("Restart changed the retained transaction ownership")
@@ -203,6 +214,7 @@ def main():
             raise AssertionError("COMMIT did not clear the retained transaction")
         transaction = None
         print(f"PASS real transaction survived replacement of all {len(urls)} Gateway processes")
+        print("PASS a pre-restart query continued through its persisted result capability")
         print("PostgreSQL, Trino processes, credentials, and new-query destination stayed unchanged.")
     finally:
         if transaction and urls and processes:

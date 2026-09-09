@@ -8,6 +8,15 @@ This directory contains a Python standard-library black-box test suite and a pro
 
 All endpoints must belong to an isolated, disposable test environment. The suite changes backend activation, routing and drain state. It must never target customer services. Fixture control endpoints have no authentication and must remain restricted to the test network.
 
+After configuring the runtime variables below, `run_contracts.py --suite normal`
+runs the complete normal contract in order and stops at the first failure.
+Use `--suite fault` only in a separate expendable lab; coordinator replacement
+runs last. `--suite real` uses the real Trino endpoints. Add `--list` to inspect
+the selected tests without contacting any endpoint. The runner can derive
+`TX_QUERY_AUTHORIZATION` from the private `TX_TRINO_USER` and `TX_TRINO_PASSWORD`
+variables without printing either credential. Native JDBC and Gateway restart
+tests remain separate, exclusive operations.
+
 ## Components
 
 - `fake_trino.py`: independent backend-local transactions, standard statement and continuation responses, transaction lifecycle headers, replayable result pages and controllable response barriers.

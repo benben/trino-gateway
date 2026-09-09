@@ -11,6 +11,10 @@ unchanged. It also compares Secret data hashes without printing their contents.
 After reopening its own loopback forwards, it verifies the transaction through
 every Gateway and commits through the last replica. Fresh queries must still
 reach the original configured coordinator.
+It also leaves one real query's advertised continuation unconsumed before the
+replacement. Afterward, that query must deliver its expected result through a
+new Gateway process. This checks persisted query ownership and capabilities,
+not only the transaction binding used by subsequent statements.
 
 Export the private `TX_TRINO_USER`, `TX_TRINO_PASSWORD`, `TX_ADMIN_TOKEN`, and
 `TX_CA_FILE` settings. The transaction ID remains only in process memory.
