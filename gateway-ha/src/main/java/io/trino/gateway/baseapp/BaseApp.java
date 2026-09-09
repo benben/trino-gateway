@@ -169,6 +169,7 @@ public class BaseApp
 
     private static void registerResources(Binder binder)
     {
+        jaxrsBinder(binder).bind(io.trino.gateway.ha.resource.TransactionResource.class);
         jaxrsBinder(binder).bind(EntityEditorResource.class);
         jaxrsBinder(binder).bind(GatewayResource.class);
         jaxrsBinder(binder).bind(GatewayViewResource.class);

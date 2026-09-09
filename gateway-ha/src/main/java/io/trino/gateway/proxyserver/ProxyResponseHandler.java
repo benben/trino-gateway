@@ -23,18 +23,27 @@ import io.trino.gateway.ha.config.ProxyResponseConfiguration;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
+import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public class ProxyResponseHandler
         implements ResponseHandler<ProxyResponse, RuntimeException>
 {
     private final DataSize responseSize;
+    private final boolean strict;
 
     public ProxyResponseHandler(ProxyResponseConfiguration proxyResponseConfiguration)
     {
+        this(proxyResponseConfiguration, false);
+    }
+
+    public ProxyResponseHandler(ProxyResponseConfiguration proxyResponseConfiguration, boolean strict)
+    {
         this.responseSize = requireNonNull(proxyResponseConfiguration.getResponseSize(), "responseSize is null");
+        this.strict = strict;
     }
 
     @Override
@@ -47,6 +56,14 @@ public class ProxyResponseHandler
     public ProxyResponse handle(Request request, Response response)
     {
         try {
+            if (strict) {
+                int limit = toIntExact(responseSize.toBytes());
+                byte[] body = response.getInputStream().readNBytes(Math.addExact(limit, 1));
+                if (body.length > limit) {
+                    throw new ProxyException("Backend response exceeds the configured response limit");
+                }
+                return new ProxyResponse(response.getStatusCode(), response.getHeaders(), StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString());
+            }
             return new ProxyResponse(response.getStatusCode(), response.getHeaders(), new String(response.getInputStream().readNBytes((int) responseSize.toBytes()), StandardCharsets.UTF_8));
         }
         catch (IOException e) {

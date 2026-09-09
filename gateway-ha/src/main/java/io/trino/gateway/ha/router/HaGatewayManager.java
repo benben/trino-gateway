@@ -46,6 +46,13 @@ public class HaGatewayManager
     private final GatewayBackendDao dao;
     private final String defaultRoutingGroup;
     private final LoadingCache<Object, List<GatewayBackend>> backendCache;
+    private boolean transactionAwarenessEnabled;
+
+    @Inject
+    public void configureTransactionAwareness(io.trino.gateway.ha.config.HaGatewayConfiguration configuration)
+    {
+        transactionAwarenessEnabled = configuration.getTransactionAwareness().isEnabled();
+    }
 
     private final CounterStat backendLookupSuccesses = new CounterStat();
     private final CounterStat backendLookupFailures = new CounterStat();
@@ -178,6 +185,9 @@ public class HaGatewayManager
 
     private void updateClusterActivationStatus(String clusterName, boolean newStatus, Runnable changeActiveStatus)
     {
+        if (transactionAwarenessEnabled) {
+            throw io.trino.gateway.ha.transaction.TransactionIdentity.error(409, "Use transaction-aware drain, resume, and cutover to control backend admission");
+        }
         GatewayBackend model = dao.findFirstByName(clusterName);
         checkState(model != null, "No cluster found with name: %s, could not (de)activate", clusterName);
 
@@ -212,6 +222,13 @@ public class HaGatewayManager
         String backendProxyTo = removeTrailingSlash(backend.getProxyTo());
         String backendExternalUrl = removeTrailingSlash(backend.getExternalUrl());
         GatewayBackend model = dao.findFirstByName(backend.getName());
+        if (transactionAwarenessEnabled && model != null && model.active() != backend.isActive()) {
+            throw io.trino.gateway.ha.transaction.TransactionIdentity.error(409, "Use transaction-aware drain, resume, and cutover to control backend admission");
+        }
+        if (transactionAwarenessEnabled && model != null &&
+                (!model.backendUrl().equals(backendProxyTo) || !model.externalUrl().equals(backendExternalUrl) || !model.routingGroup().equals(backend.getRoutingGroup()))) {
+            throw io.trino.gateway.ha.transaction.TransactionIdentity.error(409, "Transaction-aware backend destinations are immutable; create a distinct backend registration");
+        }
         if (model == null) {
             dao.create(backend.getName(), backend.getRoutingGroup(), backendProxyTo, backendExternalUrl, backend.isActive());
         }
@@ -233,6 +250,9 @@ public class HaGatewayManager
 
     public void deleteBackend(String name)
     {
+        if (transactionAwarenessEnabled) {
+            throw io.trino.gateway.ha.transaction.TransactionIdentity.error(409, "Transaction-aware backends cannot be deleted through the legacy API");
+        }
         dao.deleteByName(name);
         invalidateBackendCache();
     }

@@ -33,6 +33,7 @@ import io.trino.gateway.ha.router.OAuth2GatewayCookie;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.TrinoRequestUser;
+import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
@@ -93,6 +94,13 @@ public class ProxyRequestHandler
     private final List<String> statementPaths;
     private final boolean includeClusterInfoInResponse;
     private final ProxyResponseConfiguration proxyResponseConfiguration;
+    private TransactionAwarenessService transactionAwareness;
+
+    @Inject
+    public void setTransactionAwareness(TransactionAwarenessService transactionAwareness)
+    {
+        this.transactionAwareness = transactionAwareness;
+    }
 
     @Inject
     public ProxyRequestHandler(
@@ -187,6 +195,18 @@ public class ProxyRequestHandler
 
         FluentFuture<ProxyResponse> future = executeHttp(request);
 
+        if (transactionAwareness != null && transactionAwareness.isEnabled()) {
+            future = future.transform(response -> transactionAwareness.recordResponse(servletRequest, response), executor)
+                    .catching(Exception.class, exception -> {
+                        transactionAwareness.requestFailed(servletRequest);
+                        if (exception instanceof WebApplicationException webException) {
+                            throw webException;
+                        }
+                        throw new WebApplicationException(Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
+                                .entity("Backend request outcome is uncertain; the request was not reassigned").build());
+                    }, directExecutor());
+        }
+
         if (statementPaths.stream().anyMatch(request.getUri().getPath()::startsWith) && request.getMethod().equals(HttpMethod.POST)) {
             Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
             future = future.transform(response -> recordBackendForQueryId(request, response, username, routingDestination), executor);
@@ -248,7 +268,7 @@ public class ProxyRequestHandler
 
     private FluentFuture<ProxyResponse> executeHttp(Request request)
     {
-        return FluentFuture.from(httpClient.executeAsync(request, new ProxyResponseHandler(proxyResponseConfiguration)));
+        return FluentFuture.from(httpClient.executeAsync(request, new ProxyResponseHandler(proxyResponseConfiguration, transactionAwareness != null && transactionAwareness.isEnabled())));
     }
 
     private static Response handleProxyException(Request request, ProxyException e)

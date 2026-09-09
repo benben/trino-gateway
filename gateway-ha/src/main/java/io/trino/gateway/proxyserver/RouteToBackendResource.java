@@ -18,6 +18,7 @@ import io.trino.gateway.ha.handler.ProxyHandlerStats;
 import io.trino.gateway.ha.handler.RoutingTargetHandler;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.security.ProxyRequestAuthenticator;
+import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
@@ -45,6 +46,13 @@ public class RouteToBackendResource
     private final ProxyRequestHandler proxyRequestHandler;
     private final RoutingTargetHandler routingTargetHandler;
     private final ProxyRequestAuthenticator proxyRequestAuthenticator;
+    private TransactionAwarenessService transactionAwareness;
+
+    @Inject
+    public void setTransactionAwareness(TransactionAwarenessService transactionAwareness)
+    {
+        this.transactionAwareness = transactionAwareness;
+    }
 
     @Inject
     public RouteToBackendResource(
@@ -117,6 +125,14 @@ public class RouteToBackendResource
 
     private HttpServletRequest authenticateProxyRequest(RoutingTargetResponse routingTargetResponse)
     {
-        return proxyRequestAuthenticator.authenticate(routingTargetResponse.modifiedRequest());
+        try {
+            return proxyRequestAuthenticator.authenticate(routingTargetResponse.modifiedRequest());
+        }
+        catch (RuntimeException e) {
+            if (transactionAwareness != null && transactionAwareness.isEnabled()) {
+                transactionAwareness.requestRejectedBeforeDispatch(routingTargetResponse.modifiedRequest());
+            }
+            throw e;
+        }
     }
 }

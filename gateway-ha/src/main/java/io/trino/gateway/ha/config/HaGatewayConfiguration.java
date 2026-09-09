@@ -25,6 +25,7 @@ import java.util.Optional;
 
 import static io.trino.gateway.ha.handler.HttpUtils.V1_STATEMENT_PATH;
 import static io.trino.gateway.ha.security.ClientCertificateIdentityExtractor.SUBJECT_DN_FIELD;
+import static java.util.Objects.requireNonNull;
 
 public class HaGatewayConfiguration
 {
@@ -49,6 +50,7 @@ public class HaGatewayConfiguration
     private UIConfiguration uiConfiguration = new UIConfiguration();
     private DatabaseCacheConfiguration databaseCache = new DatabaseCacheConfiguration();
     private ClientCertificateJwtAuthenticationConfiguration clientCertificateJwtAuthentication;
+    private TransactionAwarenessConfiguration transactionAwareness = new TransactionAwarenessConfiguration();
 
     // List of Modules with FQCN (Fully Qualified Class Name)
     private List<String> modules;
@@ -287,6 +289,16 @@ public class HaGatewayConfiguration
         return clientCertificateJwtAuthentication;
     }
 
+    public TransactionAwarenessConfiguration getTransactionAwareness()
+    {
+        return transactionAwareness;
+    }
+
+    public void setTransactionAwareness(TransactionAwarenessConfiguration transactionAwareness)
+    {
+        this.transactionAwareness = requireNonNull(transactionAwareness, "transactionAwareness is null");
+    }
+
     public void setClientCertificateJwtAuthentication(ClientCertificateJwtAuthenticationConfiguration clientCertificateJwtAuthentication)
     {
         this.clientCertificateJwtAuthentication = clientCertificateJwtAuthentication;
@@ -296,6 +308,7 @@ public class HaGatewayConfiguration
     // setters in document order and checking inside a setter would depend on which field is set first.
     public void validate()
     {
+        transactionAwareness.validate(dataStore);
         if (clientCertificateJwtAuthentication == null) {
             // Nothing reads these without the bridge block, so accepting them would silently do nothing
             if (optionalNonBlank(requestAnalyzerConfig.getClientCertificateIdentityField()).isPresent()

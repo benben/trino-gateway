@@ -24,6 +24,7 @@ import io.trino.gateway.ha.router.GatewayCookie;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
+import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 
@@ -51,6 +52,13 @@ public class RoutingTargetHandler
     private final boolean requestAnalyserClientsUseV2Format;
     private final int requestAnalyserMaxBodySize;
     private final boolean cookiesEnabled;
+    private TransactionAwarenessService transactionAwareness;
+
+    @Inject
+    public void setTransactionAwareness(TransactionAwarenessService transactionAwareness)
+    {
+        this.transactionAwareness = transactionAwareness;
+    }
 
     @Inject
     public RoutingTargetHandler(
@@ -68,6 +76,14 @@ public class RoutingTargetHandler
     }
 
     public RoutingTargetResponse resolveRouting(HttpServletRequest request)
+    {
+        if (transactionAwareness != null && transactionAwareness.isEnabled()) {
+            return transactionAwareness.resolve(request, () -> resolveWithoutTransactions(request), selection -> getRoutingTargetResponse(request, selection));
+        }
+        return resolveWithoutTransactions(request);
+    }
+
+    private RoutingTargetResponse resolveWithoutTransactions(HttpServletRequest request)
     {
         Optional<String> queryId = extractQueryIdIfPresent(request, statementPaths, requestAnalyserClientsUseV2Format, requestAnalyserMaxBodySize);
         Optional<String> previousCluster = getPreviousCluster(queryId, request);
@@ -89,6 +105,11 @@ public class RoutingTargetHandler
     private RoutingTargetResponse getRoutingTargetResponse(HttpServletRequest request)
     {
         RoutingSelectorResponse routingDestination = routingGroupSelector.findRoutingDestination(request);
+        return getRoutingTargetResponse(request, routingDestination);
+    }
+
+    private RoutingTargetResponse getRoutingTargetResponse(HttpServletRequest request, RoutingSelectorResponse routingDestination)
+    {
         String user = request.getHeader(USER_HEADER);
 
         // This falls back on default routing group backend if there is no cluster found for the routing group.
@@ -99,13 +120,15 @@ public class RoutingTargetHandler
         String clusterHost = backendConfiguration.getProxyTo();
         String externalUrl = backendConfiguration.getExternalUrl();
         // Apply headers from RoutingDestination if there are any
-        HttpServletRequest modifiedRequest = request;
-        if (!routingDestination.externalHeaders().isEmpty()) {
-            modifiedRequest = new HeaderModifyingRequestWrapper(request, routingDestination.externalHeaders());
-        }
+        HttpServletRequest modifiedRequest = withRoutingHeaders(request, routingDestination.externalHeaders());
         return new RoutingTargetResponse(
                 new RoutingDestination(routingGroup, clusterHost, buildUriWithNewCluster(clusterHost, request), externalUrl),
                 modifiedRequest);
+    }
+
+    public static HttpServletRequest withRoutingHeaders(HttpServletRequest request, Map<String, String> headers)
+    {
+        return headers.isEmpty() ? request : new HeaderModifyingRequestWrapper(request, headers);
     }
 
     /**
