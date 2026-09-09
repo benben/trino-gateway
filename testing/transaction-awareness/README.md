@@ -1,5 +1,9 @@
 # Transaction-awareness integration tests
 
+See [OPERATIONS.md](OPERATIONS.md) for supported modes, configuration, cutover
+steps and failure boundaries. See [BASELINE.md](BASELINE.md) for upstream red
+evidence and [client/README.md](client/README.md) for the native JDBC fixture.
+
 This directory contains a Python standard-library black-box test suite and a protocol-focused Trino test double. Python 3.9 or newer is sufficient. The suite deliberately separates baseline controls from the new transaction-awareness contract. Contract failures against upstream are regression evidence, not a successful implementation.
 
 All endpoints must belong to an isolated, disposable test environment. The suite changes backend activation, routing and drain state. It must never target customer services. Fixture control endpoints have no authentication and must remain restricted to the test network.

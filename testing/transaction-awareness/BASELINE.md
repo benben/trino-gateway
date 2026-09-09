@@ -48,4 +48,18 @@ A separate real-Trino check also confirmed that `POST /v1/statement/` accepts a 
 
 ## Interpretation
 
+Real Trino 483 over verified HTTPS also reproduced the affinity failure. Two
+baseline controls passed. The five-test HTTP run had two assertion failures:
+an idle transaction and an active transaction reached the replacement coordinator
+and returned `UNKNOWN_TRANSACTION`. The third cutover check, rollback after an
+error, initially passed because Trino can report rollback success for an unknown
+transaction. That check now also asserts the original coordinator's query-ID
+suffix; success alone was an inadequate oracle.
+
+The unmodified JDBC 483 client passed its baseline through both Gateway replicas,
+without continuation-URL rewriting or encoding overrides. Its upstream cutover
+regression then failed with `UNKNOWN_TRANSACTION` after fresh connections had
+verified the replacement coordinator's exact node ID. This independently confirms
+the problem with a native client rather than only the Python protocol harness.
+
 This proves that existing query-ID routing works in the lab while the two new transaction guarantees fail on upstream. It does not prove the later implementation, real-client compatibility, fault recovery or safe drain. The full acceptance matrix requires additional positive tests after implementation, including real Trino processes and deliberately forced fault interleavings.
