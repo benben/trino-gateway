@@ -2,16 +2,20 @@
 """Manage only an explicitly selected disposable Gateway transaction lab."""
 
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import subprocess
 import tempfile
 import time
 
-from render import TASK, render
+from render import TASK, password_hash, render
+from tls import generate_tls
+from transaction_config import configure_transactions
 
 
 def main():
@@ -21,9 +25,18 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("create", help="Create a new isolated namespace; refuses existing namespaces")
     create.add_argument("--fake-source", type=Path, default=Path(__file__).resolve().parent.parent / "fake_trino.py")
+    create.add_argument("--proxy-source", type=Path, default=Path(__file__).resolve().parent.parent / "network_fault_proxy.py")
+    create.add_argument("--openssl", default="openssl")
+    create.add_argument("--keytool", default="keytool")
+    create.add_argument("--htpasswd", default="htpasswd")
     commands.add_parser("status")
     forward = commands.add_parser("forward", help="Keep loopback forwards running; stop with Ctrl-C")
     forward.add_argument("--base-port", type=int, default=18081)
+    forward.add_argument("--ca-file", type=Path, required=True)
+    feature = commands.add_parser("configure-transactions", help="Preserve lab credentials and configure the feature before artifact deployment")
+    feature.add_argument("--enabled", action=argparse.BooleanOptionalAction, required=True)
+    feature.add_argument("--env-file", type=Path, required=True, help="New private file for the test admin token")
+    feature.add_argument("--terminal-retention", type=int, default=2)
     artifact = commands.add_parser("artifact", help="Replace lab Gateway processes with a locally built shaded JAR")
     artifact.add_argument("--jar", type=Path, required=True)
     delete = commands.add_parser("delete", help="Delete this disposable namespace and all its test data")
@@ -56,9 +69,17 @@ def main():
         if "NotFound" not in existing.stderr:
             raise SystemExit("Namespace preflight failed; no resources were changed")
         source = args.fake_source.read_text()
-        resources = render(args.namespace, secrets.token_hex(24), source)
         runtime = Path(tempfile.mkdtemp(prefix="gateway-tx-lab-runtime-"))
         os.chmod(runtime, 0o700)
+        password = secrets.token_hex(24)
+        generate_tls(runtime / "tls", args.namespace, password, openssl=args.openssl, keytool=args.keytool)
+        tls_files = {name: (runtime / "tls" / name).read_bytes() for name in ["gateway.p12", "trino-blue.p12", "trino-green.p12", "truststore.p12"]}
+        trino_password = secrets.token_hex(24)
+        hashed = password_hash(trino_password, args.htpasswd)
+        descriptor = os.open(runtime / "trino.env", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            output.write("TX_TRINO_USER=user\nTX_TRINO_PASSWORD=" + shlex.quote(trino_password) + "\n")
+        resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed)
         for name, data in [("namespace.json", resources["items"][0]), ("resources.json", resources)]:
             target = runtime / name
             with target.open("x") as output:
@@ -75,6 +96,28 @@ def main():
     namespace_owned()
     if args.command == "status":
         kubectl("-n", args.namespace, "get", "pods,services,resourcequota")
+    elif args.command == "configure-transactions":
+        if args.env_file.exists():
+            raise SystemExit("Refusing to overwrite an existing private environment file")
+        result = kubectl("-n", args.namespace, "get", "secret", "gateway-config", "-o", "json", capture=True)
+        secret = json.loads(result.stdout)
+        if secret["metadata"].get("labels", {}).get("task") != TASK:
+            raise SystemExit("Refusing a Secret without this lab's ownership label")
+        config = json.loads(base64.b64decode(secret["data"]["config.yaml"]))
+        if config.get("dataStore", {}).get("jdbcUrl") not in {"jdbc:postgresql://postgres:5432/gateway", "jdbc:postgresql://postgres-fault-proxy:15432/gateway"}:
+            raise SystemExit("Refusing to replace an unexpected lab database address")
+        config = configure_transactions(config, enabled=args.enabled, terminal_retention=args.terminal_retention)
+        config["dataStore"]["jdbcUrl"] = "jdbc:postgresql://postgres-fault-proxy:15432/gateway"
+        secret["data"]["config.yaml"] = base64.b64encode(json.dumps(config).encode()).decode()
+        secret["metadata"].pop("managedFields", None)
+        secret["metadata"].get("annotations", {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
+        response = subprocess.run(base + ["-n", args.namespace, "replace", "-f", "-"], input=json.dumps(secret), text=True, capture_output=True, timeout=60)
+        if response.returncode:
+            raise SystemExit("Secret compare-and-swap failed; no token was written. Inspect the lab resource version before retrying.")
+        descriptor = os.open(args.env_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            output.write("TX_ADMIN_TOKEN=" + shlex.quote(config["transactionAwareness"]["adminToken"]) + "\n")
+        print("Updated the owned lab Secret with its resource version. Restart through artifact deployment when ready.")
     elif args.command == "delete":
         if args.confirm_namespace != args.namespace:
             raise SystemExit("Deletion requires the exact namespace confirmation")
@@ -107,19 +150,22 @@ def main():
         pods = gateway_pods()
         if len(pods) < 2:
             raise SystemExit("At least two running Gateway pods are required")
-        targets = ["pod/" + pod for pod in pods]
-        targets += ["service/fixture-blue", "service/fixture-green", "service/trino-blue", "service/trino-green"]
+        args.ca_file.resolve(strict=True)
+        targets = [("pod/" + pod, 8443) for pod in pods]
+        targets += [("service/fixture-blue", 8080), ("service/fixture-green", 8080), ("service/trino-blue", 8443), ("service/trino-green", 8443), ("service/postgres-fault-proxy", 8080)]
         if args.base_port < 1024 or args.base_port + len(targets) > 65536:
             raise SystemExit("Invalid local port range")
         processes = []
         try:
-            for offset, target in enumerate(targets):
-                processes.append(subprocess.Popen(base + ["-n", args.namespace, "port-forward", "--address", "127.0.0.1", target, f"{args.base_port + offset}:8080"]))
-            gateway_urls = ",".join(f"http://127.0.0.1:{args.base_port + index}" for index in range(len(pods)))
+            for offset, (target, remote_port) in enumerate(targets):
+                processes.append(subprocess.Popen(base + ["-n", args.namespace, "port-forward", "--address", "127.0.0.1", target, f"{args.base_port + offset}:{remote_port}"]))
+            gateway_urls = ",".join(f"https://127.0.0.1:{args.base_port + index}" for index in range(len(pods)))
             fixture_port = args.base_port + len(pods)
             print(f"TX_GATEWAY_URLS={gateway_urls}", flush=True)
             print(f"TX_BACKEND_URLS=http://127.0.0.1:{fixture_port},http://127.0.0.1:{fixture_port + 1}", flush=True)
             print("TX_BACKEND_PROXY_URLS=http://fixture-blue:8080,http://fixture-green:8080", flush=True)
+            print(f"TX_CA_FILE={args.ca_file.resolve()}", flush=True)
+            print(f"TX_DATABASE_FAULT_URL=http://127.0.0.1:{fixture_port + 4}", flush=True)
             while all(process.poll() is None for process in processes):
                 time.sleep(1)
             raise SystemExit("A port-forward exited; stop tests and reopen forwards")

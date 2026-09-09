@@ -1,6 +1,10 @@
 import unittest
+import base64
+import json
+from unittest.mock import patch
+from subprocess import CompletedProcess
 
-from render import TASK, render
+from render import TASK, password_hash, render
 
 
 class LabRenderTests(unittest.TestCase):
@@ -53,6 +57,54 @@ class LabRenderTests(unittest.TestCase):
         for resource in self.items:
             if resource["kind"] == "ConfigMap" and resource["metadata"]["name"].startswith("trino-"):
                 self.assertIn("http-server.process-forwarded=true", resource["data"]["config.properties"])
+
+    def test_real_trino_uses_explicit_synthetic_password_authentication(self):
+        auth = next(item for item in self.items if item["kind"] == "Secret" and item["metadata"]["name"] == "trino-test-auth")
+        self.assertEqual(auth["stringData"]["password.db"], "user:!\n")
+        custom = render(self.namespace, "synthetic-test-password", trino_password_hash="dummy-not-a-working-hash")["items"]
+        custom_auth = next(item for item in custom if item["metadata"]["name"] == "trino-test-auth")
+        self.assertEqual(custom_auth["stringData"]["password.db"], "user:dummy-not-a-working-hash\n")
+        self.assertNotEqual(auth["stringData"]["internal-secret-blue"], auth["stringData"]["internal-secret-green"])
+        repeated = next(item for item in render(self.namespace, "synthetic-test-password")["items"] if item["metadata"]["name"] == "trino-test-auth")
+        self.assertEqual(auth["stringData"], repeated["stringData"])
+        for resource in self.items:
+            if resource["kind"] == "ConfigMap" and resource["metadata"]["name"].startswith("trino-"):
+                self.assertIn("http-server.authentication.type=PASSWORD", resource["data"]["config.properties"])
+                self.assertIn("file.password-file=/etc/trino-auth/password.db", resource["data"]["password-authenticator.properties"])
+
+    def test_tls_mounts_only_server_keys_and_verifies_backend_certificates(self):
+        files = {name: b"synthetic fixture bytes" for name in ["gateway.p12", "trino-blue.p12", "trino-green.p12", "truststore.p12"]}
+        items = render(self.namespace, "synthetic-test-password", tls_files=files)["items"]
+        secret = next(item for item in items if item["metadata"]["name"] == "lab-tls")
+        self.assertEqual(set(secret["data"]), set(files))
+        self.assertEqual(base64.b64decode(secret["data"]["gateway.p12"]), files["gateway.p12"])
+        config = json.loads(next(item for item in items if item["metadata"]["name"] == "gateway-config")["stringData"]["config.yaml"])
+        for client in ["proxy", "monitor"]:
+            self.assertEqual(config["serverConfig"][client + ".http-client.trust-store-path"], "/etc/lab-tls/truststore.p12")
+        for item in items:
+            if item["kind"] == "Deployment" and item["metadata"]["name"] in {"gateway", "trino-blue", "trino-green"}:
+                pod = item["spec"]["template"]["spec"]
+                volume = next(volume for volume in pod["volumes"] if volume["name"] == "tls")
+                mounted = {entry["key"] for entry in volume["secret"]["items"]}
+                name = item["metadata"]["name"]
+                self.assertEqual(mounted, {"gateway.p12", "truststore.p12"} if name == "gateway" else {name + ".p12"})
+
+    def test_fault_proxy_is_small_and_separate_from_control_port(self):
+        items = render(self.namespace, "synthetic-test-password", proxy_source="fixture source")["items"]
+        deployment = next(item for item in items if item["kind"] == "Deployment" and item["metadata"]["name"] == "postgres-fault-proxy")
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["resources"]["requests"], {"cpu": "50m", "memory": "64Mi"})
+        service = next(item for item in items if item["kind"] == "Service" and item["metadata"]["name"] == "postgres-fault-proxy")
+        self.assertEqual({port["port"] for port in service["spec"]["ports"]}, {8080, 15432})
+
+    def test_password_hash_uses_stdin_and_checks_output(self):
+        with patch("render.subprocess.run", return_value=CompletedProcess([], 0, "not a hash")) as run:
+            with self.assertRaises(ValueError):
+                password_hash("dummy-test-input", "/test/htpasswd")
+            command = run.call_args.args[0]
+            self.assertEqual(command, ["/test/htpasswd", "-niB", "-C", "10", "user"])
+            self.assertNotIn("dummy-test-input", command)
+            self.assertEqual(run.call_args.kwargs["input"], "dummy-test-input\n")
 
 
 if __name__ == "__main__":

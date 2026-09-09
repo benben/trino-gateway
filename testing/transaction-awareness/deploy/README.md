@@ -7,9 +7,18 @@ upstream version 21. Trino is version 483.
 
 The namespace has restricted pod security, no mounted service-account tokens,
 no host privileges, and no public Ingress or load balancer. NetworkPolicy permits
-only same-namespace test traffic and cluster DNS. Resources request 3.45 CPUs and
-8.75 GiB total; a quota caps requests and limits at 8 CPUs, 16 GiB, and 20 pods.
+only same-namespace test traffic and cluster DNS. Resources request 3.5 CPUs and
+8.8125 GiB total; a quota caps requests and limits at 8 CPUs, 16 GiB, and 20 pods.
 PostgreSQL uses `emptyDir`: pod replacement loses all test state.
+
+The real Trino coordinators use a randomly generated, per-lab password.
+Only its bcrypt hash is stored in the namespace-local authentication Secret.
+The private runtime file `trino.env` contains `TX_TRINO_USER` and
+`TX_TRINO_PASSWORD` for test processes. No working credential is checked in.
+Queries use HTTPS with a private, seven-day test CA. Both Gateways verify the
+backend certificates, and clients verify the Gateway certificates. HTTP remains
+available for isolated health checks, not password-authenticated queries. Never
+reuse these credentials or test certificates for a deployed service.
 
 Review cluster capacity and the rendered resources before creating the lab.
 Use an explicitly authorized **development** context and a unique namespace:
@@ -20,15 +29,38 @@ python3 testing/transaction-awareness/deploy/lab.py \
 python3 testing/transaction-awareness/deploy/lab.py \
   --context <development-context> --namespace gateway-tx-lab-<unique-id> status
 python3 testing/transaction-awareness/deploy/lab.py \
-  --context <development-context> --namespace gateway-tx-lab-<unique-id> forward
+  --context <development-context> --namespace gateway-tx-lab-<unique-id> \
+  forward --ca-file <private-runtime-directory>/tls/ca.crt
 ```
 
-`create` refuses existing namespaces. It generates test credentials in a private
+`create` requires OpenSSL 3, a JDK `keytool`, and Apache `htpasswd` on PATH.
+Use `--openssl`, `--keytool`, and `--htpasswd` to select explicit executable
+paths. Password hashing sends the generated password through standard input,
+not process arguments. The command refuses existing namespaces
+and generates test credentials and certificates in a private
 temporary directory and performs server-side dry runs. Do not publish that
 directory, generated Secret manifests, or raw cluster diagnostics. `forward`
 opens loopback listeners for distinct Gateway pods, the fixtures, and real Trino
 coordinators. It prints the fixture suite's endpoint variables. Export those
 variables in another terminal and follow the parent test README.
+Set `TX_CA_FILE` to the generated `tls/ca.crt`. Do not disable TLS verification.
+
+The PostgreSQL fault proxy exposes a separate namespace-only HTTP control port.
+The forward command prints `TX_DATABASE_FAULT_URL` for this endpoint. Before
+testing a feature-enabled artifact, configure the owned Gateway Secret:
+
+```sh
+python3 testing/transaction-awareness/deploy/lab.py \
+  --context <development-context> --namespace gateway-tx-lab-<unique-id> \
+  configure-transactions --enabled --env-file <new-private-environment-file>
+```
+
+This preserves database credentials and shared transaction keys, uses a Secret
+resource-version check, and selects the fault proxy for database traffic. It
+sets two-second terminal retention for tests, not the production default. The
+private environment file contains `TX_ADMIN_TOKEN`; export it only to test
+processes. The command does not restart Gateway pods. Deploy the matching
+feature artifact next. Existing malformed keys cause an error, not rotation.
 
 No registry publication is needed to test a local shaded Gateway JAR:
 
@@ -45,8 +77,8 @@ pod loses its uploaded artifact; repeat the artifact command after replacement.
 Use this destructive lab operation only between test runs, not as a model of a
 production rolling deployment.
 
-The real Trino services are `http://trino-blue:8080` and
-`http://trino-green:8080`. Register them with separate backend names and routing
+The real Trino services are `https://trino-blue:8443` and
+`https://trino-green:8443`. Register them with separate backend names and routing
 groups from the Python fixtures. Trino processes forwarded headers so result
 continuation URLs can remain at the Gateway. Test this using an unmodified
 client; a fixture URL rewriter does not establish client compatibility.
