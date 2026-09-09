@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import socket
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,16 +15,21 @@ class State:
         self.identity = identity
         self.lock = threading.RLock()
         self.release = threading.Event()
+        self.poll_release = threading.Event()
         self.release.set()
         self.reset()
 
     def reset(self):
         with self.lock:
+            self.node_id = str(uuid.uuid4())
+            self.coordinator_id = uuid.uuid4().hex[:5]
             self.transactions = {}
             self.queries = {}
             self.requests = []
-            self.config = {"start_header_page": 0, "hold_start": False}
+            self.config = {"start_header_page": 0, "clear_header_page": 0,
+                           "hold_start": False, "hold_poll": False}
             self.release.set()
+            self.poll_release.set()
 
 
 def make_server(host="127.0.0.1", port=0, identity="blue"):
@@ -36,7 +42,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             pass
 
         def respond(self, status, value, headers=()):
-            body = b"" if status == 204 else json.dumps(value).encode()
+            body = b"" if status == 204 else value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -50,6 +56,11 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
 
         def body(self):
             return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+
+        def disconnect(self):
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
 
         def base(self):
             return "http://" + self.headers["Host"]
@@ -67,12 +78,14 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 with state.lock:
                     self.respond(200, {"identity": state.identity,
                                        "transactions": dict(state.transactions),
+                                       "nodeId": state.node_id, "coordinatorId": state.coordinator_id,
                                        "requests": list(state.requests),
                                        "config": dict(state.config)})
                 return
             if path == "/v1/info":
                 self.respond(200, {"nodeVersion": {"version": "test"},
                                    "environment": "test", "coordinator": True,
+                                   "nodeId": state.node_id, "coordinatorId": state.coordinator_id,
                                    "starting": False, "uptime": "1.00m"})
                 return
             if path == "/v1/info/state":
@@ -88,8 +101,15 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             self.record()
             with state.lock:
                 response = state.queries.get(path)
+                config = dict(state.config)
             if response is None:
                 self.respond(404, {"error": "Unknown query"})
+                return
+            if config.get("hold_poll") and not state.poll_release.wait(30):
+                self.respond(503, {"error": "Test poll barrier timed out"})
+                return
+            if config.get("drop_poll_response"):
+                self.disconnect()
                 return
             self.respond(*response)
 
@@ -107,8 +127,16 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 state.reset()
                 self.respond(200, {})
                 return
+            if path == "/__test/restart":
+                state.reset()
+                self.respond(200, {"nodeId": state.node_id, "coordinatorId": state.coordinator_id})
+                return
             if path == "/__test/release":
-                state.release.set()
+                kind = json.loads(raw or b"{}").get("kind", "all")
+                if kind in ("all", "start"):
+                    state.release.set()
+                if kind in ("all", "poll"):
+                    state.poll_release.set()
                 self.respond(200, {})
                 return
             if path == "/__test/config":
@@ -117,6 +145,8 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                     state.config.update(values)
                     if values.get("hold_start"):
                         state.release.clear()
+                    if values.get("hold_poll"):
+                        state.poll_release.clear()
                 self.respond(200, {})
                 return
             if path != "/v1/statement":
@@ -129,7 +159,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             transaction = supplied[0] if supplied else "NONE"
             with state.lock:
                 config = dict(state.config)
-                query_id = "20260101_000000_" + str(uuid.uuid4().int % 100000000) + "_" + state.identity
+                query_id = "20260101_000000_" + str(uuid.uuid4().int % 100000000) + "_" + state.coordinator_id
                 result = {"id": query_id, "infoUri": self.base() + "/ui/query.html?" + query_id,
                           "stats": {"state": "FINISHED", "queued": False,
                                     "scheduled": True, "nodes": 1, "totalSplits": 1,
@@ -141,16 +171,24 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                                     "spilledBytes": 0}, "warnings": []}
                 headers = []
                 starts = command.startswith("START TRANSACTION")
+                clears = command in ("COMMIT", "ROLLBACK")
                 if starts:
-                    transaction = str(uuid.uuid4())
+                    transaction = config.get("force_transaction_id") or str(uuid.uuid4())
                     state.transactions[transaction] = {"user": self.headers.get("X-Trino-User")}
                     headers.append(("X-Trino-Started-Transaction-Id", transaction))
+                    duplicate = config.get("duplicate_start_headers")
+                    if duplicate:
+                        headers.append(("X-Trino-Started-Transaction-Id",
+                                        transaction if duplicate == "same" else str(uuid.uuid4())))
                     result["updateType"] = "START TRANSACTION"
                 elif transaction != "NONE" and transaction not in state.transactions:
                     result["error"] = {"message": "Unknown transaction on " + state.identity,
                                        "errorCode": 65541, "errorName": "UNKNOWN_TRANSACTION",
                                        "errorType": "USER_ERROR"}
-                elif command in ("COMMIT", "ROLLBACK"):
+                elif config.get("query_error") or (command == "COMMIT" and config.get("fail_commit")):
+                    result["error"] = {"message": "Synthetic query failure", "errorCode": 1,
+                                       "errorName": "GENERIC_USER_ERROR", "errorType": "USER_ERROR"}
+                elif clears:
                     state.transactions.pop(transaction, None)
                     headers.append(("X-Trino-Clear-Transaction-Id", "true"))
                     result["updateType"] = command
@@ -161,9 +199,17 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 poll_path = "/v1/statement/executing/" + query_id + "/token/1"
                 initial_headers = headers
                 terminal_headers = []
-                if starts and config["start_header_page"] == 1:
+                if (starts and config["start_header_page"] == 1) or (clears and config["clear_header_page"] == 1):
                     initial_headers, terminal_headers = [], headers
-                state.queries[poll_path] = (200, result, terminal_headers)
+                if config.get("lowercase_headers"):
+                    initial_headers = [(name.lower(), value) for name, value in initial_headers]
+                    terminal_headers = [(name.lower(), value) for name, value in terminal_headers]
+                terminal = result
+                if config.get("malformed_terminal"):
+                    terminal = b"not-a-protocol-response"
+                elif config.get("terminal_padding_bytes"):
+                    terminal["testPadding"] = "x" * min(int(config["terminal_padding_bytes"]), 4 * 1024 * 1024)
+                state.queries[poll_path] = (200, terminal, terminal_headers)
                 first = {"id": query_id, "infoUri": result["infoUri"],
                          "nextUri": self.base() + poll_path,
                          "stats": {**result["stats"], "state": "RUNNING"}, "warnings": []}
@@ -171,6 +217,9 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 if not state.release.wait(30):
                     self.respond(503, {"error": "Test barrier timed out"})
                     return
+            if starts and config.get("drop_start_response"):
+                self.disconnect()
+                return
             self.respond(200, first, initial_headers)
 
     server = ThreadingHTTPServer((host, port), Handler)

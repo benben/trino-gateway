@@ -111,11 +111,18 @@ class GatewayFixture(unittest.TestCase):
         self.resume(1)
         self.activate(0)
         for index in (0, 1):
-            self.configure(index, start_header_page=0, hold_start=False)
+            self.configure(index, start_header_page=0, clear_header_page=0,
+                           hold_start=False, hold_poll=False, duplicate_start_headers=None,
+                           force_transaction_id=None, query_error=False, fail_commit=False,
+                           lowercase_headers=False, malformed_terminal=False,
+                           terminal_padding_bytes=0, drop_start_response=False, drop_poll_response=False)
 
     def tearDown(self):
         for index in (0, 1):
             request(self.backends[index] + "/__test/release", "POST", "{}")
+            self.configure(index, query_error=False, fail_commit=False,
+                           drop_start_response=False, drop_poll_response=False,
+                           malformed_terminal=False, terminal_padding_bytes=0)
         for transaction in self.transactions:
             try:
                 finish(self.submit("ROLLBACK", transaction), self.gateways[0])
@@ -141,9 +148,13 @@ class GatewayFixture(unittest.TestCase):
     def rejected_without_forward(self, transaction, extra=(), user="user"):
         before = self.submissions()
         response = self.submit("SELECT 1", transaction, gateway=1, extra=extra, user=user)
-        self.assertGreaterEqual(response.status, 400, response.body)
-        self.assertLess(response.status, 500, response.body)
-        self.assertEqual(self.submissions(), before, "Gateway forwarded a rejected transaction")
+        try:
+            self.assertGreaterEqual(response.status, 400, response.body)
+            self.assertLess(response.status, 500, response.body)
+            self.assertEqual(self.submissions(), before, "Gateway forwarded a rejected transaction")
+        finally:
+            if response.status == 200:
+                finish(response, self.gateways[1])
 
 
 class BaselineControls(GatewayFixture):

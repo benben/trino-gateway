@@ -10,6 +10,9 @@ All endpoints must belong to an isolated, disposable test environment. The suite
 - `protocol.py`: HTTP client that preserves repeated headers and can send successive requests through different Gateway processes.
 - `test_fake_trino.py`: local fixture self-tests. These establish fixture behavior, not Gateway correctness.
 - `test_gateway.py`: baseline controls and transaction contract assertions against separate Gateway processes sharing one PostgreSQL database.
+- `test_adversarial.py`: additional identity, replay, query-error and seal-interleaving assertions.
+- `network_fault_proxy.py`: TCP-transparent database fault boundary with an isolated HTTP control port.
+- `test_faults.py`: response-loss, conflicting-header, cancellation, database-outage and coordinator-restart assertions.
 - `deploy/`: environment setup and runtime configuration, maintained separately from the protocol suite.
 
 Start two fake backends with different identities:
@@ -21,7 +24,9 @@ python3 fake_trino.py --host 0.0.0.0 --port 8081 --identity green
 
 The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages and query cancellation. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
 
-Direct fixture controls are `GET /__test/state`, `POST /__test/reset`, `POST /__test/config` and `POST /__test/release`. Configuration supports `start_header_page` (0 for the initial response, 1 for the continuation) and `hold_start` (pause before the start response). State records request methods, paths, SQL and transaction headers. Do not put real credentials or data in fixture queries.
+Direct fixture controls are `GET /__test/state`, `POST /__test/reset`, `POST /__test/config`, `POST /__test/restart` and `POST /__test/release`. Each simulated process has a distinct `nodeId` and `coordinatorId`; query IDs use that coordinator suffix. Restart changes both identities and clears backend-local transactions and query results. It does not simulate process recovery or migrate a transaction.
+
+Configuration supports `start_header_page` and `clear_header_page` (0 for the initial response, 1 for the continuation), `hold_start`, `hold_poll`, `drop_start_response`, `drop_poll_response`, `duplicate_start_headers` (`same` or `conflict`), `force_transaction_id`, `query_error`, `fail_commit`, `lowercase_headers`, `malformed_terminal` and `terminal_padding_bytes`. Release can select a barrier with `{"kind":"start"}` or `{"kind":"poll"}`; the default releases both. State records request methods, paths, SQL and transaction headers, but not Authorization. Do not put real credentials or data in fixture queries.
 
 ## Configuration
 
@@ -38,6 +43,9 @@ Register the two fixture backends in the same Gateway routing group. Use distinc
 | `TX_ADMIN_TOKEN` | Optional API-role bearer token for admin calls. |
 | `TX_QUERY_AUTHORIZATION` | Query authorization header; defaults to synthetic Basic credentials `user:test-password`. |
 | `TX_READINESS_TIMEOUT_SECONDS` | Backend health convergence deadline; defaults to 120 seconds for upstream health polling. |
+| `TX_CA_FILE` | Optional private CA file for HTTPS fixture endpoints. Certificate and hostname verification remain enabled. |
+| `TX_DATABASE_FAULT_URL` | Direct URL for the isolated TCP proxy's HTTP control port. |
+| `TX_ALLOW_IRREVERSIBLE_FAULTS` | Must be `yes` for fault suites that intentionally leave uncertain obligations or restart a coordinator. |
 
 Keep actual endpoint values, secrets and raw environment output outside the repository. For transaction-aware runs, enable the feature and configure the same randomly generated identity key on every Gateway. See the feature configuration documentation for the key requirements. Do not disable authentication binding to make tests pass.
 
@@ -47,8 +55,10 @@ From this directory:
 
 ```sh
 python3 -m unittest -v test_fake_trino
+python3 -m unittest -v test_network_fault_proxy
 python3 -m unittest -v test_gateway.BaselineControls
 python3 -m unittest -v test_gateway.TransactionContract
+python3 -m unittest -v test_adversarial
 ```
 
 Missing fixture configuration is an error, not a skipped test. Baseline controls must pass before interpreting contract failures. There are no expected-failure annotations. Record the tested Gateway commit, image, process count, database configuration and commands with each run. Keep private runtime details in an untracked receipt outside the repository.
@@ -61,8 +71,28 @@ The admin contract uses `/gateway/transactions/backends/{name}/drain`, `/seal`, 
 
 Run each complete contract against a fresh fixture when collecting upstream failure evidence. Upstream cannot reconcile its missing ownership ledger; failed scenarios can leave backend-local transactions. The fixture does not pretend that direct backend cleanup reconciles an enabled Gateway ledger. A failed run must be diagnosed before reusing its state for drain assertions.
 
+## Fault injection
+
+Point every test Gateway's JDBC connection at the TCP proxy, not directly at PostgreSQL:
+
+```sh
+python3 network_fault_proxy.py --host 0.0.0.0 --port 15432 \
+  --control-port 8080 --upstream-host postgres --upstream-port 5432
+```
+
+`POST /__test/config` with `{"available":false}` closes existing sockets and rejects new connections. `{"available":true}` permits new connections again. There is no bypass or fallback route. The tests force backend acceptance with an observable barrier before disabling database access, so response-recording failures are distinct from failures before admission.
+
+Run irreversible fault tests after all normal suites, preferably with a fresh fixture per method. Database-outage and uncertain-response tests intentionally leave durable obligations. The restarted-coordinator test is last and intentionally does not resume or clean up the old incarnation. Discard the lab afterward; do not delete ledger rows to describe these cases as successfully drained.
+
+```sh
+python3 -m unittest -v test_faults.DatabaseFaultContract
+python3 -m unittest -v test_faults.FaultContract
+```
+
+These suites require explicit fault opt-in. Their assertions compare obligation counts before and after each injected fault. Existing uncertain rows cannot substitute for evidence that the new fault was tracked. A PostgreSQL outage affects every fixture Gateway, so no other suite may run concurrently against that lab.
+
 ## Limits of this suite
 
 The fake server implements the protocol subset needed for deterministic routing tests. It does not execute SQL, implement connector transactions, enforce backend authentication or reproduce Trino memory loss. It is not a substitute for real-Trino tests using supported clients and transaction-capable catalogs.
 
-Production acceptance also requires real coordinator restart/loss, Gateway restart between database commit and response delivery, PostgreSQL faults, lost responses, cancellation ambiguity, terminal-result retry windows and seal-versus-continuation races. These scenarios must use actual fault injection; passing mock or fixture-only tests does not establish those guarantees. Never claim that an in-memory transaction survives the loss of its coordinator.
+Production acceptance also requires real coordinator restart/loss and Gateway restart between database commit and response delivery. The fake-process restart and TCP fault boundary do not replace those process-level experiments. Passing fixture self-tests only validates the test tools; the black-box assertions still need execution against the actual implementation. Never claim that an in-memory transaction survives the loss of its coordinator.

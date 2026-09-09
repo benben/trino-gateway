@@ -2,6 +2,8 @@
 
 import http.client
 import json
+import os
+import ssl
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,8 +23,13 @@ class Response:
 
 def request(url, method="GET", body=None, headers=(), timeout=40):
     parsed = urlsplit(url)
-    connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-    connection = connection_type(parsed.hostname, parsed.port, timeout=timeout)
+    if parsed.scheme == "https":
+        context = ssl.create_default_context(cafile=os.environ.get("TX_CA_FILE"))
+        connection = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=timeout, context=context)
+    elif parsed.scheme == "http":
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    else:
+        raise ValueError("Only HTTP and HTTPS endpoints are supported")
     payload = body.encode() if isinstance(body, str) else body
     try:
         connection.putrequest(method, urlunsplit(("", "", parsed.path or "/", parsed.query, "")))
