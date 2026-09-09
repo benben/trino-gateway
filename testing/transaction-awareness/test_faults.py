@@ -104,8 +104,9 @@ class FaultContract(GatewayFixture):
         self.assertEqual(len(self.state(0)["transactions"]), transactions + 1)
         self.assert_new_uncertainty(before)
 
-    def test_cancel_racing_result_keeps_uncertainty(self):
-        initial = self.submit("SELECT 1")
+    def test_cancel_racing_result_keeps_query_and_transaction_obligations(self):
+        transaction = self.start()
+        initial = self.submit("SELECT 1", transaction)
         self.assertEqual(initial.status, 200, initial.body)
         uri = initial.json()["nextUri"]
         self.configure(0, hold_poll=True)
@@ -120,11 +121,25 @@ class FaultContract(GatewayFixture):
                     time.sleep(0.01)
                 cancelled = request(through_gateway(uri, self.gateways[1]), "DELETE")
                 self.assertEqual(cancelled.status, 204, cancelled.body)
+                state = self.backend_status().json()
+                self.assertEqual(state["pendingRequests"], before_pending + 1)
+                self.assertGreaterEqual(state["activeQueries"], 1)
+                self.assertGreaterEqual(state["openTransactions"], 1)
+                path = "/gateway/transactions/backends/" + self.names[0]
+                draining = self.admin(path + "/drain", "POST")
+                self.assertEqual(draining.status, 200, draining.body)
+                state = self.backend_status().json()
+                self.assertFalse(state["readyToSeal"])
+                sealed = self.admin(path + "/seal", "POST", {"generation": state["generation"]})
+                self.assertEqual(sealed.status, 409, sealed.body)
             finally:
                 request(self.backends[0] + "/__test/release", "POST", '{"kind": "poll"}')
                 response = pending.result(timeout=10)
                 self.assertEqual(response.status, 200, response.body)
-        self.assert_new_uncertainty(before_pending)
+        self.assertEqual(self.pending_count(), before_pending)
+        self.assertIn(transaction, self.state(0)["transactions"])
+        self.complete(self.submit("ROLLBACK", transaction))
+        self.assertEqual(self.pending_count(), before_pending)
 
     def test_same_transaction_id_from_another_backend_cannot_replace_owner(self):
         transaction = self.start()

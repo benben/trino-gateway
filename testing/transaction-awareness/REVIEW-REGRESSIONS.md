@@ -11,6 +11,7 @@ for the pre-implementation evidence. Private runtime output remains outside Git.
 | Duplicate JSON fields can hide a continuation or overwrite identity | 74 adapter tests: four failures, 70 controls passed | Reject duplicate fields before any ledger operation |
 | Missing continuation with a nonterminal or missing state appears complete | 83 adapter tests: seven failures, 76 controls passed | Require FINISHED or FAILED when no continuation remains |
 | A resume prepared before sealing can succeed after sealing | 39 PostgreSQL tests: two failures, 37 controls passed | Advance generation on sealing; reject stale lifecycle requests |
+| Acknowledged cancellation leaves unnecessary permanent uncertainty | 90 adapter tests: three failures, 87 controls passed | Settle only the bound DELETE request; preserve query, transaction and retention state |
 
 The terminal-state invariant was checked against Trino tag 483. Executing results
 omit their continuation only for a failed query or final query information.
@@ -25,3 +26,9 @@ after sealing remains possible; the external deployment controller must serializ
 that decision with stopping the coordinator.
 
 These targeted receipts do not replace the final multi-process acceptance run.
+
+After adding terminal-state validation, the four duplicate-field fixtures were
+strengthened to end with an otherwise valid FINISHED state. A mutation run that
+removed duplicate detection still failed all four cases; restoring it passed all
+83 adapter cases at that checkpoint. Another validation must not mask the parser
+regression.

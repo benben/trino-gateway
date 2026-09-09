@@ -19,6 +19,9 @@ Each key must contain at least 32 UTF-8 bytes. Generate them outside source
 control. Do not rotate them while transactions or retained queries remain.
 The lab helper generates and preserves them. The admin endpoints also retain the
 Gateway's existing API-role check and require this separate bearer token.
+All replicas serving this traffic must enable the feature and run compatible
+ledger-aware code. Do not mix feature-disabled or pre-feature replicas into the
+same endpoint: they can forward requests without creating drain obligations.
 
 The initial identity mode requires stable HTTP Basic credentials and consistent
 effective/original Trino users. Backend authentication and authorization remain
@@ -91,12 +94,18 @@ or recover them after coordinator loss. Do not retry an ambiguous statement on
 another coordinator. Ordinary cutover can coexist with a busy warehouse, but an
 indefinitely open transaction can prevent finite, zero-abort retirement.
 
-Transport loss, database failure after admission, cancellation and malformed or
+Transport loss, database failure after admission, ambiguous cancellation and malformed or
 contradictory responses can leave durable uncertainty. There is no automatic
 expiry or reconciliation of these obligations in this implementation. They block
 drain rather than being reported as successful completion. A human deleting such
 state would be an explicit loss-of-guarantee action, not graceful draining; no
 force-clear API is provided.
+
+A successful, bound DELETE with HTTP 204 and no lifecycle headers settles only
+that request's admission. It does not complete the query, clear its transaction,
+or change result retention. An in-flight poll remains independently tracked.
+If a cancelled query never delivers a terminal result, its query obligation still
+blocks retirement; automatic coordinator-side reconciliation is not implemented.
 
 The terminal retry window defaults to 120 seconds and can be 1–86400 seconds.
 Gateway retains affinity, not response bodies. It cannot prove receipt by the

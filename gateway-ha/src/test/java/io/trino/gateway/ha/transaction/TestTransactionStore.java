@@ -240,6 +240,29 @@ class TestTransactionStore
     }
 
     @Test
+    void settledCancellationPreservesConcurrentPollAndTerminalRetention()
+    {
+        Admission start = first.admitNew("blue", "owner", "group");
+        first.recordResponse(start.id(), new ResponseObservation("start", "transaction", false, true, 120));
+        String originalRetention = retention("start");
+        Admission poll = first.admitQuery("start", Optional.of("owner"), Optional.of("transaction"));
+        Admission cancellation = second.admitQuery("start", Optional.of("owner"), Optional.of("transaction"));
+        second.rejectAdmission(cancellation.id());
+        var status = first.beginDrain("blue");
+        assertThat(status.pendingRequests()).isEqualTo(1);
+        assertThat(status.openTransactions()).isEqualTo(1);
+        assertThat(status.activeQueries()).isEqualTo(1);
+        assertThat(first.getQuery("start").orElseThrow().terminal()).isTrue();
+        assertThat(retention("start")).isEqualTo(originalRetention);
+        expect(NOT_DRAINED, () -> second.seal("blue", status.generation()));
+        first.rejectAdmission(poll.id());
+        assertThat(second.drainStatus("blue").pendingRequests()).isZero();
+        assertThat(second.drainStatus("blue").activeQueries()).isEqualTo(1);
+        assertThat(second.getTransaction("transaction").orElseThrow().state()).isEqualTo("OPEN");
+        assertThat(retention("start")).isEqualTo(originalRetention);
+    }
+
+    @Test
     void terminalWindowAndLateContinuationFenceSealing()
     {
         Admission admission = first.admitNew("blue", "owner", "group");

@@ -149,10 +149,10 @@ class TestTransactionAwarenessService
 
     @ParameterizedTest
     @ValueSource(strings = {
-            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{},\"nextUri\":\"http://blue.example.test/v1/statement/executing/20260909_120000_00001_abcde/capability/1\",\"nextUri\":null}",
-            "{\"id\":\"20260909_120000_00002_abcde\",\"id\":\"20260909_120000_00001_abcde\",\"stats\":{}}",
-            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":null,\"stats\":{}}",
-            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{},\"partialCancelUri\":\"http://blue.example.test/v1/statement/executing/partialCancel/20260909_120000_00001_abcde/1/capability/1\",\"partialCancelUri\":null}",
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{\"state\":\"FINISHED\"},\"nextUri\":\"http://blue.example.test/v1/statement/executing/20260909_120000_00001_abcde/capability/1\",\"nextUri\":null}",
+            "{\"id\":\"20260909_120000_00002_abcde\",\"id\":\"20260909_120000_00001_abcde\",\"stats\":{\"state\":\"FINISHED\"}}",
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":null,\"stats\":{\"state\":\"FINISHED\"}}",
+            "{\"id\":\"20260909_120000_00001_abcde\",\"stats\":{\"state\":\"FINISHED\"},\"partialCancelUri\":\"http://blue.example.test/v1/statement/executing/partialCancel/20260909_120000_00001_abcde/1/capability/1\",\"partialCancelUri\":null}",
     })
     void duplicateResultFieldsCannotSettleAdmissionOrRecordCapabilities(String body)
     {
@@ -249,7 +249,7 @@ class TestTransactionAwarenessService
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {204, 400, 409, 429, 500, 503})
+    @ValueSource(ints = {400, 409, 429, 500, 503})
     void unprovenNonSuccessResponsesRemainUncertain(int status)
     {
         HttpServletRequest request = admitted("DELETE", CONTINUATION, QUERY, null);
@@ -282,6 +282,41 @@ class TestTransactionAwarenessService
         assertThat(service.recordResponse(request, rejected)).isSameAs(rejected);
         verify(store).rejectAdmission(admission.id());
         verify(store, never()).markUncertain(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {CONTINUATION, "/v1/statement/executing/partialCancel/" + QUERY + "/1/capability/1", "/v1/query/" + QUERY})
+    void acknowledgedCancellationSettlesOnlyTransport(String path)
+    {
+        HttpServletRequest request = admitted("DELETE", path, QUERY, TRANSACTION);
+        Admission admission = admission(request);
+        ProxyResponse acknowledged = response(204, "");
+        assertThat(service.recordResponse(request, acknowledged)).isSameAs(acknowledged);
+        verify(store).rejectAdmission(admission.id());
+        verify(store, never()).markUncertain(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "GET", "HEAD"})
+    void nonCancellationNoContentRemainsUncertain(String method)
+    {
+        HttpServletRequest request = admitted(method, method.equals("POST") ? "/v1/statement" : CONTINUATION, method.equals("POST") ? null : QUERY, TRANSACTION);
+        service.recordResponse(request, response(204, ""));
+        verify(store).markUncertain(admission(request).id());
+        verify(store, never()).rejectAdmission(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"X-Trino-Started-Transaction-Id", "X-Trino-Clear-Transaction-Id"})
+    void cancellationAcknowledgementWithLifecycleSignalRemainsUncertain(String header)
+    {
+        HttpServletRequest request = admitted("DELETE", CONTINUATION, QUERY, TRANSACTION);
+        service.recordResponse(request, response(204, "", header, TRANSACTION));
+        verify(store).markUncertain(admission(request).id());
+        verify(store, never()).rejectAdmission(any());
         verify(store, never()).recordResponse(any(), any());
     }
 

@@ -187,7 +187,9 @@ public class TransactionAwarenessService
             return response;
         }
         return guarded(() -> {
-            if (response.statusCode() == 404 && admission.queryId() != null && List.of("GET", "HEAD", "DELETE").contains(request.getMethod()) &&
+            boolean rejectedContinuation = response.statusCode() == 404 && List.of("GET", "HEAD", "DELETE").contains(request.getMethod());
+            boolean completedCancellation = response.statusCode() == 204 && request.getMethod().equals("DELETE");
+            if ((rejectedContinuation || completedCancellation) && admission.queryId() != null &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
                 store.rejectAdmission(admission.id());
                 return response;
