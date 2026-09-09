@@ -22,6 +22,9 @@ Gateway's existing API-role check and require this separate bearer token.
 All replicas serving this traffic must enable the feature and run compatible
 ledger-aware code. Do not mix feature-disabled or pre-feature replicas into the
 same endpoint: they can forward requests without creating drain obligations.
+Use the same authoritative PostgreSQL writer for ledger reads and writes, not
+asynchronous read replicas. The protocol assumes committed ledger data is durable.
+Database failover and production-scale performance require separate validation.
 
 The initial identity mode requires stable HTTP Basic credentials and consistent
 effective/original Trino users. Backend authentication and authorization remain
@@ -93,6 +96,8 @@ A coordinator owns its in-memory transactions. Gateway does not replicate them
 or recover them after coordinator loss. Do not retry an ambiguous statement on
 another coordinator. Ordinary cutover can coexist with a busy warehouse, but an
 indefinitely open transaction can prevent finite, zero-abort retirement.
+Query or transaction failure when its coordinator dies is an accepted, separate
+failure scope; the planned-cutover guarantee does not include coordinator recovery.
 
 Transport loss, database failure after admission, ambiguous cancellation and malformed or
 contradictory responses can leave durable uncertainty. There is no automatic
