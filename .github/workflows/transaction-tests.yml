@@ -48,4 +48,4 @@ jobs:
         run: python3 -m unittest -v test_fake_trino test_network_fault_proxy
       - name: Disposable lab tooling tests
         working-directory: testing/transaction-awareness/deploy
-        run: python3 -m unittest -v test_render test_transaction_config
+        run: python3 -m unittest discover -p 'test_*.py' -v

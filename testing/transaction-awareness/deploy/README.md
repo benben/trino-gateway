@@ -72,7 +72,9 @@ python3 testing/transaction-awareness/deploy/lab.py \
 
 This deliberately replaces only the lab Gateway pods. It copies the artifact
 into each new pod's `emptyDir`, then starts Java. It does not build an image or
-upload anything to a registry. Reopen port-forwards afterwards. A replacement
+upload anything to a registry. Reopen port-forwards afterwards. The helper
+uses at most two concurrent uploads, verifies each SHA-256 digest, and renames
+each verified file atomically before starting Java. A replacement
 pod loses its uploaded artifact; repeat the artifact command after replacement.
 Use this destructive lab operation only between test runs, not as a model of a
 production rolling deployment.

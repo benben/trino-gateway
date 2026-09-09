@@ -3,6 +3,8 @@
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,24 @@ import time
 from render import TASK, password_hash, render
 from tls import generate_tls
 from transaction_config import configure_transactions
+
+
+def upload_artifacts(kubectl, pods, jar):
+    digest = hashlib.sha256()
+    with jar.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    expected = digest.hexdigest()
+
+    def upload(pod):
+        kubectl("cp", str(jar), f"{pod}:/artifact/upload.jar", "-c", "gateway", timeout=300)
+        result = kubectl("exec", pod, "-c", "gateway", "--", "sha256sum", "/artifact/upload.jar", capture=True)
+        if not result.stdout.split() or result.stdout.split()[0] != expected:
+            raise RuntimeError("Uploaded lab artifact checksum did not match")
+        kubectl("exec", pod, "-c", "gateway", "--", "mv", "/artifact/upload.jar", "/artifact/launch.jar")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(upload, pods))
 
 
 def main():
@@ -142,9 +162,7 @@ def main():
             time.sleep(1)
         if len(pods) != expected:
             raise SystemExit("Timed out waiting for isolated Gateway upload pods; no artifact was published")
-        for pod in pods:
-            kubectl("-n", args.namespace, "cp", str(jar), f"{pod}:/artifact/upload.jar", "-c", "gateway", timeout=300)
-            kubectl("-n", args.namespace, "exec", pod, "-c", "gateway", "--", "mv", "/artifact/upload.jar", "/artifact/launch.jar")
+        upload_artifacts(lambda *parts, **options: kubectl("-n", args.namespace, *parts, **options), pods, jar)
         print("Artifact uploaded only to lab emptyDir volumes. Reopen forwards after pod replacement.")
     elif args.command == "forward":
         pods = gateway_pods()
