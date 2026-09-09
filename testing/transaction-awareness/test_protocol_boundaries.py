@@ -1,5 +1,6 @@
 """Fail-closed checks for protocol paths, methods and unsupported result modes."""
 
+import time
 import unittest
 
 from protocol import request, through_gateway
@@ -47,6 +48,42 @@ class ProtocolBoundaryContract(GatewayFixture):
 
     def test_put_continuation_is_rejected_before_admission(self):
         self.reject_method("PUT")
+
+    def test_noncanonical_continuations_cannot_bypass_sealed_backend(self):
+        initial = self.submit("SELECT 1")
+        self.complete(initial)
+        path = "/gateway/transactions/backends/" + self.names[0]
+        draining = self.admin(path + "/drain", "POST")
+        self.assertEqual(draining.status, 200, draining.body)
+        try:
+            deadline = time.monotonic() + 150
+            while True:
+                status = self.backend_status()
+                self.assertEqual(status.status, 200, status.body)
+                if status.json()["readyToSeal"]:
+                    break
+                self.assertLess(time.monotonic(), deadline, "Backend did not become ready to seal")
+                time.sleep(0.1)
+            sealed = self.admin(path + "/seal", "POST", {"generation": status.json()["generation"]})
+            self.assertEqual(sealed.status, 200, sealed.body)
+            uri = through_gateway(initial.json()["nextUri"], self.gateways[1])
+            aliases = [
+                uri.replace("/v1/statement/", "/v1/statement;matrix/", 1),
+                uri.replace("/v1/statement/", "/v1/%73tatement/", 1),
+                uri.replace("/v1/statement/", "/v1/./statement/", 1),
+                uri.replace("/v1/statement/", "/v1//statement/", 1),
+            ]
+            before = self.request_count()
+            for method in ("GET", "HEAD", "DELETE"):
+                for alias in aliases:
+                    with self.subTest(method=method, alias=alias):
+                        response = request(alias, method)
+                        self.assertGreaterEqual(response.status, 400, response.body)
+                        self.assertLess(response.status, 500, response.body)
+                        self.assertEqual(self.request_count(), before)
+            self.assertTrue(self.backend_status().json()["sealed"])
+        finally:
+            self.resume()
 
     def test_legacy_backend_toggles_cannot_bypass_durable_routing(self):
         for action in ("deactivate", "activate"):

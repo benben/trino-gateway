@@ -134,6 +134,7 @@ public class BaseApp
         addManagedApps(configuration, binder);
         jaxrsBinder(binder).bind(AuthorizedExceptionMapper.class);
         binder.bind(ProxyHandlerStats.class).in(Scopes.SINGLETON);
+        binder.bind(io.trino.gateway.ha.transaction.TransactionAwarenessService.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ProxyHandlerStats.class).withGeneratedName();
         binder.bind(RoutingRulesManager.class);
         binder.bind(ClusterMetricsStatsExporter.class).in(Scopes.SINGLETON);

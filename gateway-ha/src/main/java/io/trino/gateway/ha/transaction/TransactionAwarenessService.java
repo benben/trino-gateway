@@ -98,6 +98,12 @@ public class TransactionAwarenessService
 
     public RoutingTargetResponse resolve(HttpServletRequest request, Supplier<RoutingTargetResponse> ordinaryRouting, Function<RoutingSelectorResponse, RoutingTargetResponse> selectBackend)
     {
+        if (isEnabled()) {
+            String path = request.getRequestURI();
+            if (path == null || path.contains(";") || path.contains("%") || path.contains("\\") || path.contains("//") || !URI.create(path).normalize().getPath().equals(path)) {
+                throw error(400, "Transaction-aware proxy requests require a canonical path");
+            }
+        }
         boolean submission = request.getMethod().equals("POST") && statementPaths.contains(request.getRequestURI());
         boolean continuation = !request.getMethod().equals("POST") && (statementPaths.stream().anyMatch(path -> request.getRequestURI().startsWith(path + "/")) || request.getRequestURI().startsWith("/v1/query/"));
         if (isEnabled() && request.getMethod().equals("POST") && !submission) {
@@ -144,6 +150,9 @@ public class TransactionAwarenessService
                 }
             }
             else {
+                if (request.getRequestURI().startsWith("/v1/query/") && TransactionIdentity.singleHeader(request, "Authorization").isEmpty()) {
+                    throw error(401, "Query metadata and query-ID cancellation require owner credentials");
+                }
                 String queryId = extractQueryIdIfPresent(request.getRequestURI(), null, statementPaths)
                         .orElseThrow(() -> error(400, "Invalid query continuation path"));
                 QueryBinding query = store.getQuery(queryId).orElseThrow(() -> error(404, "Unknown query identifier"));
@@ -338,7 +347,7 @@ public class TransactionAwarenessService
         return guarded(() -> {
             ProxyBackendConfiguration backend = backendManager.getBackendByName(name).orElseThrow(() -> error(404, "Unknown backend"));
             JsonNode info = processInfo(backend.getProxyTo());
-            BackendRef proposed = new BackendRef(name, UUID.randomUUID(), backend.getProxyTo(), backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
+            BackendRef proposed = new BackendRef(name, UUID.randomUUID(), backend.getProxyTo(), backend.getExternalUrl() == null ? backend.getProxyTo() : backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
             return status(store.reincarnate(name, incarnation, generation, proposed));
         });
     }

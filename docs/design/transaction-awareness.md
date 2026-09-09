@@ -69,12 +69,14 @@ Verified mTLS principal binding is a possible separate resolver. It requires an
 explicitly tested certificate-validation and mapping boundary. Generic servlet
 principals, UI cookies, and decoded JWT claims must not be assumed verified.
 
-Continuation GET/DELETE requests can omit Authorization according to the client
+Continuation GET/HEAD/DELETE requests can omit Authorization according to the client
 protocol. Preserve the original query binding and the exact opaque continuation
 path; let the backend validate its capability. A bare query ID is not equivalent
 to a continuation capability. If a continuation supplies credentials or a
 transaction ID, contradictory ownership must fail closed. Do not synthesize
 missing credentials, reveal the binding, or route to another backend on denial.
+Query metadata and cancellation through `/v1/query/{id}` require matching Basic
+credentials: those paths contain no opaque result capability.
 Separate the credential HMAC from the effective/original-user context HMAC in the
 internal owner binding. An authenticated continuation that omits user headers can
 then prove the same credential without guessing the original impersonated user.
@@ -96,7 +98,7 @@ The following are semantic records, not a promise of finalized table names:
 | Query binding | Query ID, owner binding, backend incarnation, optional transaction ID, execution/result state and replay-retention metadata |
 | Admission obligation | A statement selected for a backend that has not yet been conclusively bound to a query or rejected before acceptance |
 
-Every forwarded request, including continuation GET and DELETE, creates an
+Every forwarded protocol request, including continuation GET, HEAD and DELETE, creates an
 admission obligation. Status counts unresolved admissions, open transactions,
 and queries that are nonterminal or still inside their terminal retry window.
 Database time determines retry-window expiry so replica clock skew cannot seal
@@ -173,7 +175,7 @@ state before exposing those headers or a new query continuation to the client.
 Header names are case-insensitive. Reject duplicate or contradictory ownership
 signals rather than selecting an arbitrary value. Do not infer commit or rollback
 success solely from SQL text or an HTTP 200 status.
-The clear header carries a boolean signal, not a transaction ID. Resolve its
+The presence of the clear header signals clearing; its value is not a transaction ID. Resolve its
 transaction through the admission or query binding. A start response also binds
 its query to the newly created transaction, even though the original request had
 no transaction ID. This relationship must survive delayed header replays.
