@@ -10,6 +10,11 @@ in [VALIDATION.md](VALIDATION.md) describes a different implementation checkpoin
 - Bounded pool, request capacity, phase deadlines and drain indexes: `2adce62`.
 - Candidate shaded artifact SHA-256:
   `47043d0410eddd294fb0c8065bf1d364ea936b21d99e09c645f6da1d1aa30daf`.
+- Published candidate image:
+  `ghcr.io/benben/trino-gateway@sha256:1b55f3bfe11ef83fb55b2a338968a1dfbd781899ed70c43195aa7e05810c6f29`.
+  Both architecture manifests identify source `2adce62`. Its CI-packaged JAR has
+  SHA-256 `9d2e78975a2d9f6d8ff69964cd798efbf38b254c27493b7171147df0b7db390c`.
+  This published artifact, not the local archive, is used for live candidate tests.
 
 ## Genuine red tests
 
@@ -28,6 +33,7 @@ container setup or test-fixture failures:
 | Query-history cleanup retry | A scheduled cleanup exception prevented the next cleanup execution. |
 | Multi-process overload | A held seventeenth continuation reached the client timeout instead of receiving an immediate 503. |
 | Multi-process probe deadline | A held identity probe exceeded a two-second client wait despite a 500 ms routing budget. |
+| Load-checkpoint oracle | Seven contradictory readiness/count cases incorrectly passed the original test helper. |
 
 The drain test exercises the production SQL with live blockers and expired history.
 It asserts fewer than 64 shared-buffer accesses, not a machine-specific elapsed time.
@@ -60,15 +66,21 @@ It records a terminal response after client timeout while three admission
 connections remain occupied, and observes exactly four pooled PostgreSQL sessions.
 It does not replace network or multi-process tests.
 
-The integrated Python fixtures, fault proxy and open-loop scheduler passed 36
-self-tests. The disposable deployment helpers passed 23 checks. The scheduler's
+The integrated Python fixtures, fault proxy, open-loop scheduler and checkpoint
+oracle passed 52 self-tests. The disposable deployment helpers passed 24 checks. The scheduler's
 tests cover routing-group and per-method replica distribution, rejected requests,
 client scheduling drops and invalid warmups.
 
 Two upstream proxy suites require Docker and could not run on the local host.
-The full CI matrix must cover them; this receipt does not count their setup errors
-as successful tests. Kubernetes protocol, native JDBC, restart and load reruns are
-not yet complete at this checkpoint.
+The full CI matrix subsequently passed on Java 25, 26 and 27-ea, including the
+container-dependent suites, plus Docker and the dedicated transaction workflow.
+The [implementation CI run](https://github.com/benben/trino-gateway/actions/runs/34466159500)
+and [publisher run](https://github.com/benben/trino-gateway/actions/runs/34466159538)
+both completed successfully.
+
+The live deadline regression passed on the published image with the same 500 ms
+routing budget used for its baseline failure. Full Kubernetes protocol, native
+JDBC, restart and load reruns are not yet complete at this checkpoint.
 
 ## Interpretation limits
 
