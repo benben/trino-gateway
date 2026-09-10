@@ -3,6 +3,9 @@
 Use only an explicitly authorized disposable lab. Keep endpoints, credentials,
 generated manifests, and raw results outside this public repository.
 
+See [database measurements and cost estimates](DATABASE_COST.md) for aligned
+request rates, connection samples, ACUs, idle baselines, and cost attribution.
+
 `test_overload.OverloadContract` holds sixteen accepted continuations on one
 Gateway. The seventeenth must receive `503` with `Retry-After` before backend
 dispatch. It releases and consumes all held pages. `TX_EXPECT_MAX_IN_FLIGHT`
