@@ -28,6 +28,9 @@ import static java.util.Objects.requireNonNull;
 
 public final class TransactionStore
 {
+    private static final int QUERY_LOCK_NAMESPACE = 0x54585152;
+    private static final int TRANSACTION_LOCK_NAMESPACE = 0x54585452;
+
     static final String DRAIN_STATUS_SQL =
             """
             SELECT b.state, b.generation,
@@ -144,9 +147,9 @@ public final class TransactionStore
     public Admission admitNew(String candidateName, String ownerHash, String routingGroup)
     {
         return jdbi.inTransaction(handle -> {
-            lockRoute(handle, routingGroup);
+            lockRoute(handle, routingGroup, false);
             String selected = findRoute(handle, routingGroup).orElse(candidateName);
-            BackendRef backend = lockBackend(handle, selected);
+            BackendRef backend = shareBackend(handle, selected);
             check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
             check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Backend does not accept new statements");
             return insertAdmission(handle, backend, ownerHash, null, null);
@@ -157,7 +160,8 @@ public final class TransactionStore
     {
         return jdbi.inTransaction(handle -> {
             TransactionBinding initial = findTransaction(handle, transactionId).orElseThrow(() -> missing("transaction"));
-            BackendRef backend = lockIncarnation(handle, initial.backend().incarnation());
+            BackendRef backend = shareIncarnation(handle, initial.backend().incarnation());
+            lockIdentity(handle, TRANSACTION_LOCK_NAMESPACE, transactionId);
             TransactionBinding binding = findTransaction(handle, transactionId).orElseThrow(() -> missing("transaction"));
             checkOwner(binding.ownerHash(), ownerHash);
             check(binding.state().equals("OPEN"), ErrorCode.CONFLICT, "Transaction is closed");
@@ -175,8 +179,12 @@ public final class TransactionStore
     {
         return jdbi.inTransaction(handle -> {
             QueryBinding initial = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
-            BackendRef backend = lockIncarnation(handle, initial.backend().incarnation());
+            BackendRef backend = shareIncarnation(handle, initial.backend().incarnation());
+            lockIdentity(handle, QUERY_LOCK_NAMESPACE, queryId);
             QueryBinding binding = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
+            if (binding.transactionId() != null) {
+                lockIdentity(handle, TRANSACTION_LOCK_NAMESPACE, binding.transactionId());
+            }
             ownerHash.ifPresent(owner -> checkOwner(binding.ownerHash(), owner));
             transactionId.ifPresent(transaction -> check(transaction.equals(binding.transactionId()), ErrorCode.CONFLICT, "Query and transaction disagree"));
             capabilityHash.ifPresent(hash -> {
@@ -204,6 +212,7 @@ public final class TransactionStore
             String queryId = observation.queryId() == null ? admission.queryId() : observation.queryId();
             check(queryId != null && !queryId.isEmpty(), ErrorCode.CONFLICT, "Response has no query identity");
             check(admission.queryId() == null || admission.queryId().equals(queryId), ErrorCode.CONFLICT, "Response query identity changed");
+            lockIdentity(handle, QUERY_LOCK_NAMESPACE, queryId);
             Optional<QueryBinding> previous = findQuery(handle, queryId);
             previous.ifPresent(query -> {
                 checkOwner(query.ownerHash(), admission.ownerHash());
@@ -220,8 +229,13 @@ public final class TransactionStore
             }
             if (observation.startedTxId() != null) {
                 check(transactionId == null || transactionId.equals(observation.startedTxId()), ErrorCode.CONFLICT, "Response starts a different transaction");
-                bindStartedTransaction(handle, observation.startedTxId(), admission, queryId);
                 transactionId = observation.startedTxId();
+            }
+            if (transactionId != null) {
+                lockIdentity(handle, TRANSACTION_LOCK_NAMESPACE, transactionId);
+            }
+            if (observation.startedTxId() != null) {
+                bindStartedTransaction(handle, observation.startedTxId(), admission, queryId);
             }
             bindQuery(handle, queryId, admission, transactionId);
             for (String hash : observation.capabilityHashes()) {
@@ -385,8 +399,13 @@ public final class TransactionStore
 
     private static void lockRoute(Handle handle, String routingGroup)
     {
+        lockRoute(handle, routingGroup, true);
+    }
+
+    private static void lockRoute(Handle handle, String routingGroup, boolean exclusive)
+    {
         handle.createUpdate("INSERT INTO transaction_route (routing_group) VALUES (:group) ON CONFLICT DO NOTHING").bind("group", routingGroup).execute();
-        handle.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = :group FOR UPDATE")
+        handle.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = :group FOR " + (exclusive ? "UPDATE" : "SHARE"))
                 .bind("group", routingGroup).mapTo(String.class).one();
     }
 
@@ -411,16 +430,29 @@ public final class TransactionStore
 
     private static Admission lockAdmissionBackend(Handle handle, UUID admissionId)
     {
-        Admission admission = handle.createQuery(
+        Admission initial = findAdmission(handle, admissionId, false);
+        shareIncarnation(handle, initial.backend().incarnation());
+        return findAdmission(handle, admissionId, true);
+    }
+
+    private static Admission findAdmission(Handle handle, UUID admissionId, boolean exclusive)
+    {
+        return handle.createQuery(
                         """
                         SELECT a.admission_id, a.owner_hash, a.transaction_id, a.query_id, b.*
                         FROM transaction_admission a JOIN transaction_backend b USING (incarnation)
                         WHERE admission_id = :id
-                        """).bind("id", admissionId)
+                        """ + (exclusive ? " FOR UPDATE OF a" : "")).bind("id", admissionId)
                 .map((rs, _) -> new Admission(rs.getObject("admission_id", UUID.class), backend(rs), rs.getString("owner_hash"), rs.getString("transaction_id"), rs.getString("query_id")))
                 .findOne().orElseThrow(() -> missing("admission"));
-        lockIncarnation(handle, admission.backend().incarnation());
-        return admission;
+    }
+
+    private static void lockIdentity(Handle handle, int namespace, String identity)
+    {
+        // Acquire the backend fence first, then the admission row, query identity, and transaction identity when applicable.
+        // Separate namespaces prevent query and transaction hash collisions from reversing that order.
+        handle.createQuery("SELECT pg_advisory_xact_lock(:namespace, :identity)")
+                .bind("namespace", namespace).bind("identity", identity.hashCode()).mapTo(String.class).one();
     }
 
     private static void bindStartedTransaction(Handle handle, String transactionId, Admission admission, String queryId)
@@ -481,9 +513,15 @@ public final class TransactionStore
                 .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend"));
     }
 
-    private static BackendRef lockIncarnation(Handle handle, UUID incarnation)
+    private static BackendRef shareBackend(Handle handle, String name)
     {
-        return handle.createQuery("SELECT * FROM transaction_backend WHERE incarnation = :id FOR UPDATE").bind("id", incarnation)
+        return handle.createQuery("SELECT * FROM transaction_backend WHERE current_name = :name FOR SHARE").bind("name", name)
+                .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend"));
+    }
+
+    private static BackendRef shareIncarnation(Handle handle, UUID incarnation)
+    {
+        return handle.createQuery("SELECT * FROM transaction_backend WHERE incarnation = :id FOR SHARE").bind("id", incarnation)
                 .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend incarnation"));
     }
 

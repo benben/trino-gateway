@@ -51,6 +51,7 @@ import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.STALE_G
 import static io.trino.gateway.ha.util.TestcontainersUtils.createPostgreSqlContainer;
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 import static org.junit.jupiter.api.parallel.ExecutionMode.SAME_THREAD;
@@ -424,6 +425,298 @@ class TestTransactionStore
     }
 
     @Test
+    void independentAdmissionProgressesWhileAnotherQueryCompletionWaits()
+            throws Exception
+    {
+        assertIndependentRequestProgress(false, "blue");
+    }
+
+    @Test
+    void independentCompletionProgressesWhileAnotherQueryCompletionWaits()
+            throws Exception
+    {
+        assertIndependentRequestProgress(true, "blue");
+    }
+
+    @Test
+    void otherBackendCompletionProgressesWhileAnotherQueryCompletionWaits()
+            throws Exception
+    {
+        assertIndependentRequestProgress(true, "green");
+    }
+
+    @Test
+    void concurrentConflictingCallbacksKeepExactlyOneAdmissionOutcome()
+            throws Exception
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("one", null, false, false, 0));
+        Admission admission = first.admitNew("blue", "owner", "group");
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT query_id FROM transaction_query WHERE query_id = 'one' FOR UPDATE").mapTo(String.class).one();
+            var completion = executor.submit(() -> first.recordResponse(admission.id(), new ResponseObservation("one", null, false, true, 0)));
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var conflicting = executor.submit(() -> second.recordResponse(admission.id(), new ResponseObservation("two", null, false, true, 0)));
+                assertThatThrownBy(() -> conflicting.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                fence.rollback();
+                completion.get(5, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> conflicting.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(StoreException.class)
+                        .satisfies(error -> assertThat(((StoreException) error.getCause()).code()).isEqualTo(CONFLICT));
+            }
+            finally {
+                if (fence.isInTransaction()) {
+                    fence.rollback();
+                }
+            }
+        }
+        assertThat(first.getQuery("one").orElseThrow().terminal()).isTrue();
+        assertThat(first.getQuery("two")).isEmpty();
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void concurrentFirstQueryBindingsCannotCrossOwnersOrBackends()
+            throws Exception
+    {
+        Admission blue = first.admitNew("blue", "first-owner", "group");
+        Admission green = first.admitNew("green", "second-owner", "group");
+        assertOneObservationWins(
+                blue,
+                new ResponseObservation("shared-query", null, false, true, 0),
+                green,
+                new ResponseObservation("shared-query", null, false, true, 0));
+        var binding = first.getQuery("shared-query").orElseThrow();
+        assertThat(binding.ownerHash()).isEqualTo(binding.backend().name().equals("blue") ? "first-owner" : "second-owner");
+        assertThat(first.drainStatus("blue").pendingRequests() + first.drainStatus("green").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void concurrentTransactionIdentityCollisionRollsBackLosingQuery()
+            throws Exception
+    {
+        Admission blue = first.admitNew("blue", "owner", "group");
+        Admission green = first.admitNew("green", "owner", "group");
+        assertOneObservationWins(
+                blue,
+                new ResponseObservation("blue-start", "shared-transaction", false, true, 0),
+                green,
+                new ResponseObservation("green-start", "shared-transaction", false, true, 0));
+        var transaction = first.getTransaction("shared-transaction").orElseThrow();
+        assertThat(first.getQuery(transaction.startQueryId()).orElseThrow().backend()).isEqualTo(transaction.backend());
+        assertThat(first.getQuery("blue-start").isPresent() ^ first.getQuery("green-start").isPresent()).isTrue();
+        assertThat(first.drainStatus("blue").pendingRequests() + first.drainStatus("green").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void advisoryHashCollisionCannotRebindDistinctQueries()
+            throws Exception
+    {
+        assertThat("Aa".hashCode()).isEqualTo("BB".hashCode());
+        Admission blue = first.admitNew("blue", "blue-owner", "group");
+        Admission green = first.admitNew("green", "green-owner", "group");
+        CountDownLatch start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var one = executor.submit(() -> attemptObservation(start, first, blue, new ResponseObservation("Aa", null, false, true, 0)));
+            var two = executor.submit(() -> attemptObservation(start, second, green, new ResponseObservation("BB", null, false, true, 0)));
+            start.countDown();
+            assertThat(one.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(two.get(5, TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(first.getQuery("Aa").orElseThrow().backend()).isEqualTo(blue.backend());
+        assertThat(first.getQuery("BB").orElseThrow().backend()).isEqualTo(green.backend());
+        assertThat(first.getQuery("Aa").orElseThrow().ownerHash()).isEqualTo("blue-owner");
+        assertThat(first.getQuery("BB").orElseThrow().ownerHash()).isEqualTo("green-owner");
+    }
+
+    @Test
+    void transactionHashFenceCannotBlockUnrelatedQueryNamespace()
+            throws Exception
+    {
+        assertThat("Aa".hashCode()).isEqualTo("BB".hashCode());
+        Admission admission = first.admitNew("blue", "owner", "group");
+        try (Handle fence = database.open(); var executor = Executors.newSingleThreadExecutor()) {
+            fence.begin();
+            fence.createQuery("SELECT pg_advisory_xact_lock(:namespace, :identity)")
+                    .bind("namespace", 0x54585452).bind("identity", "Aa".hashCode()).mapTo(String.class).one();
+            try {
+                var completion = executor.submit(() -> first.recordResponse(admission.id(), new ResponseObservation("BB", null, false, true, 0)));
+                assertThatCode(() -> completion.get(2, TimeUnit.SECONDS)).doesNotThrowAnyException();
+                assertThat(first.getQuery("BB").orElseThrow().transactionId()).isNull();
+            }
+            finally {
+                fence.rollback();
+            }
+        }
+    }
+
+    @Test
+    void lateStartPublicationPrecedesWaitingContinuationAdmission()
+            throws Exception
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0));
+        Admission observation = first.admitQuery("query", Optional.empty(), Optional.empty());
+        String capability = "a".repeat(64);
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT query_id FROM transaction_query WHERE query_id = 'query' FOR UPDATE").mapTo(String.class).one();
+            var publication = executor.submit(() -> first.recordResponse(observation.id(), new ResponseObservation("query", "late-transaction", false, false, 0, List.of(capability))));
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var continuation = executor.submit(() -> second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(capability)));
+                assertThatThrownBy(() -> continuation.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                fence.rollback();
+                publication.get(5, TimeUnit.SECONDS);
+                assertThat(continuation.get(5, TimeUnit.SECONDS).transactionId()).isEqualTo("late-transaction");
+            }
+            finally {
+                if (fence.isInTransaction()) {
+                    fence.rollback();
+                }
+            }
+        }
+    }
+
+    @Test
+    void transactionClosePrecedesWaitingTransactionAdmission()
+            throws Exception
+    {
+        startTransaction("transaction", "start");
+        Admission commit = first.admitTransaction("transaction", "owner");
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT transaction_id FROM transaction_binding WHERE transaction_id = 'transaction' FOR UPDATE").mapTo(String.class).one();
+            var closing = executor.submit(() -> first.recordResponse(commit.id(), new ResponseObservation("commit", null, true, true, 0)));
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var admission = executor.submit(() -> second.admitTransaction("transaction", "owner"));
+                assertThatThrownBy(() -> admission.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                fence.rollback();
+                closing.get(5, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> admission.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(StoreException.class)
+                        .satisfies(error -> assertThat(((StoreException) error.getCause()).code()).isEqualTo(CONFLICT));
+                assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+            }
+            finally {
+                if (fence.isInTransaction()) {
+                    fence.rollback();
+                }
+            }
+        }
+    }
+
+    @Test
+    void drainWaitsForSharedCompletionFenceBeforeSealing()
+            throws Exception
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0));
+        Admission observation = first.admitQuery("query", Optional.empty(), Optional.empty());
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT query_id FROM transaction_query WHERE query_id = 'query' FOR UPDATE").mapTo(String.class).one();
+            var completion = executor.submit(() -> first.recordResponse(observation.id(), new ResponseObservation("query", null, false, true, 0)));
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var drain = executor.submit(() -> second.beginDrain("blue"));
+                assertThatThrownBy(() -> drain.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
+                fence.rollback();
+                completion.get(5, TimeUnit.SECONDS);
+                var status = drain.get(5, TimeUnit.SECONDS);
+                assertThat(status.readyToSeal()).isTrue();
+                assertThat(first.seal("blue", status.generation()).drained()).isTrue();
+            }
+            finally {
+                if (fence.isInTransaction()) {
+                    fence.rollback();
+                }
+            }
+        }
+    }
+
+    private void assertOneObservationWins(Admission firstAdmission, ResponseObservation firstObservation, Admission secondAdmission, ResponseObservation secondObservation)
+            throws Exception
+    {
+        CountDownLatch start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var one = executor.submit(() -> attemptObservation(start, first, firstAdmission, firstObservation));
+            var two = executor.submit(() -> attemptObservation(start, second, secondAdmission, secondObservation));
+            start.countDown();
+            assertThat(new boolean[] {one.get(5, TimeUnit.SECONDS), two.get(5, TimeUnit.SECONDS)}).containsExactlyInAnyOrder(true, false);
+        }
+    }
+
+    private static boolean attemptObservation(CountDownLatch start, TransactionStore store, Admission admission, ResponseObservation observation)
+            throws InterruptedException
+    {
+        assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
+        try {
+            store.recordResponse(admission.id(), observation);
+            return true;
+        }
+        catch (StoreException expected) {
+            assertThat(expected.code()).isIn(CONFLICT, OWNER_MISMATCH);
+            return false;
+        }
+    }
+
+    private void awaitDatabaseWaiter(int fencePid)
+            throws InterruptedException
+    {
+        long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < waitDeadline) {
+            boolean waiting = database.withHandle(handle -> handle.createQuery(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY (pg_blocking_pids(pid)))")
+                    .bind("pid", fencePid).mapTo(Boolean.class).one());
+            if (waiting) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("The database operation did not reach the held row fence");
+    }
+
+    private void assertIndependentRequestProgress(boolean completeIndependentRequest, String independentBackend)
+            throws Exception
+    {
+        Admission initial = first.admitNew("blue", "owner", "group");
+        first.recordResponse(initial.id(), new ResponseObservation("blocked-query", null, false, false, 0));
+        Admission blocked = first.admitQuery("blocked-query", Optional.empty(), Optional.empty());
+        Admission independent = first.admitNew(independentBackend, "other-owner", "group");
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT query_id FROM transaction_query WHERE query_id = 'blocked-query' FOR UPDATE").mapTo(String.class).one();
+            var blockedCompletion = executor.submit(() -> first.recordResponse(blocked.id(), new ResponseObservation("blocked-query", null, false, true, 0)));
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var progress = executor.submit(() -> {
+                    if (completeIndependentRequest) {
+                        second.recordResponse(independent.id(), new ResponseObservation("independent-query", null, false, true, 0));
+                    }
+                    else {
+                        second.admitNew(independentBackend, "independent-owner", "group");
+                    }
+                });
+                assertThatCode(() -> progress.get(2, TimeUnit.SECONDS))
+                        .as("An unrelated request must not wait for another query's completion")
+                        .doesNotThrowAnyException();
+                assertThat(blockedCompletion.isDone()).isFalse();
+            }
+            finally {
+                fence.rollback();
+                blockedCompletion.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
     void admissionWaitsForGroupFenceAndUsesCommittedOverride()
             throws Exception
     {
@@ -523,6 +816,51 @@ class TestTransactionStore
         first.setRoute("group", "green");
         assertThat(first.reincarnate("blue", old.incarnation(), generation, replacement(old, "new-process")).state()).isEqualTo("DRAINING");
         assertThat(first.admitNew("blue", "owner", "group").backend().name()).isEqualTo("green");
+    }
+
+    @Test
+    void concurrentRouteAssignmentCannotRaceSealedBackendReplacement()
+            throws Exception
+    {
+        first.setRoute("group", "green");
+        BackendRef old = first.getBackend("blue").orElseThrow();
+        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
+        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
+            fence.begin();
+            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            fence.createQuery("SELECT current_name FROM transaction_backend WHERE current_name = 'blue' FOR UPDATE").mapTo(String.class).one();
+            var replacement = executor.submit(() -> {
+                return first.reincarnate("blue", old.incarnation(), generation, replacement(old, "replacement-process"));
+            });
+            try {
+                awaitDatabaseWaiter(fencePid);
+                var assignment = executor.submit(() -> second.setRoute("group", "blue"));
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                long waiters = 0;
+                while (System.nanoTime() < deadline) {
+                    waiters = database.withHandle(handle -> handle.createQuery(
+                                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' " +
+                                            "AND query LIKE 'SELECT * FROM transaction_backend WHERE current_name%'")
+                            .mapTo(Long.class).one());
+                    if (waiters == 2) {
+                        break;
+                    }
+                    Thread.sleep(10);
+                }
+                assertThat(waiters).isEqualTo(2);
+                fence.rollback();
+                assertThat(replacement.get(5, TimeUnit.SECONDS).state()).isEqualTo("DRAINING");
+                assertThatThrownBy(() -> assignment.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(StoreException.class)
+                        .satisfies(error -> assertThat(((StoreException) error.getCause()).code()).isIn(NOT_ACTIVE, NOT_FOUND));
+            }
+            finally {
+                if (fence.isInTransaction()) {
+                    fence.rollback();
+                }
+            }
+        }
+        assertThat(first.getRoute("group")).contains("green");
+        assertThat(first.getBackend("blue").orElseThrow().incarnation()).isNotEqualTo(old.incarnation());
     }
 
     @Test
