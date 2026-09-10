@@ -45,6 +45,14 @@ window duration. These rates count POSTs and continuation GETs together, not
 SQL queries. Existing per-Gateway method counters retain their separate POST
 and GET totals, including separately named cleanup counters.
 
+For aligned cost measurements, `--measurement-start-utc '<ISO-8601-Z-time>'`
+waits after warmup before starting the measurement. The start must be at most
+600 seconds away when warmup finishes. The client rejects starts missed by more
+than one second, including an excessive delay while waiting. Receipts preserve
+the actual window and add `planned_window_start_utc` and
+`measurement_start_drift_seconds`; both are null when no start was requested.
+These timestamps do not establish clock synchronization with the database.
+
 ```sh
 export TX_ALLOW_FIXTURE_MUTATION=yes
 export TX_GATEWAY_URLS='<independent-gateway-https-endpoints>'

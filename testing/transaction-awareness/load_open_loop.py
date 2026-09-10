@@ -92,7 +92,8 @@ class VerifiedNameConnection(http.client.HTTPSConnection):
 
 class OpenLoop:
     def __init__(self, gateways, groups, authorization, *, rate, duration, concurrency=128,
-                 timeout=10, maximum_lag=.05, transport=None, expected_backends=None):
+                 timeout=10, maximum_lag=.05, transport=None, expected_backends=None,
+                 measurement_start_utc=None):
         if not gateways or not groups or not authorization:
             raise ValueError("Explicit gateways, routing groups, and runtime authorization are required")
         if not 1 <= rate <= 10000 or not 0 < duration <= 600 or rate * duration > 1_000_000:
@@ -105,6 +106,11 @@ class OpenLoop:
         self.maximum_lag = maximum_lag
         self.transport = transport or Connections(gateways, timeout)
         self.expected_backends = expected_backends or {}
+        self.measurement_start = None
+        if measurement_start_utc is not None:
+            if not measurement_start_utc.endswith("Z") or "T" not in measurement_start_utc:
+                raise ValueError("Measurement start must use ISO 8601 UTC with a Z suffix")
+            self.measurement_start = datetime.fromisoformat(measurement_start_utc[:-1] + "+00:00")
         self.pending = deque()
         self.lock = threading.Lock()
         self.counts = Counter()
@@ -196,8 +202,19 @@ class OpenLoop:
 
     def run(self):
         permit = threading.BoundedSemaphore(self.concurrency)
+        if self.measurement_start is not None:
+            delay = self.measurement_start.timestamp() - time.time()
+            if delay > 600:
+                raise ValueError("Measurement start must be at most 600 seconds away after warmup")
+            if delay < -1:
+                raise ValueError("Scheduled measurement start was missed by more than one second")
+            if delay > 0:
+                time.sleep(delay)
         beginning = time.monotonic()
         window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
+        start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
+        if start_drift is not None and abs(start_drift) > 1:
+            raise ValueError("Scheduled measurement start was missed or the UTC clock changed")
         cpu_beginning = time.process_time()
         end = beginning + self.duration
         self.window_beginning, self.window_end = beginning, end
@@ -248,6 +265,8 @@ class OpenLoop:
         return {"scheduled_http_requests": planned, "target_http_rps": self.rate,
                 "window_start_utc": window_start_utc.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "window_end_utc": (window_start_utc + timedelta(seconds=self.duration)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "planned_window_start_utc": None if self.measurement_start is None else self.measurement_start.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "measurement_start_drift_seconds": start_drift,
                 "second_buckets": self.second_buckets, "request_rates": request_rates,
                 "window_seconds": self.duration, "completion_elapsed_seconds": measured_elapsed,
                 "offered_http_rps": counts.get("started_in_window", 0) / self.duration,
@@ -272,6 +291,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=128)
     parser.add_argument("--timeout", type=float, default=10)
     parser.add_argument("--warmup", type=float, default=10)
+    parser.add_argument("--measurement-start-utc", help="Optional ISO 8601 Z start after warmup, at most 600 seconds away")
     parser.add_argument("--output", required=True, help="New private JSON receipt path")
     parser.add_argument("--print-receipt", action="store_true", help="Print metrics for capture from a completed disposable Job")
     args = parser.parse_args()
@@ -285,7 +305,8 @@ def main():
     options = dict(rate=args.rate, concurrency=args.concurrency, timeout=args.timeout, expected_backends=expected)
     authorization = os.environ.get("TX_QUERY_AUTHORIZATION", "")
     warmup = OpenLoop(gateways, groups, authorization, duration=args.warmup, **options).run() if args.warmup else None
-    result = OpenLoop(gateways, groups, authorization, duration=args.duration, **options).run()
+    result = OpenLoop(gateways, groups, authorization, duration=args.duration,
+                      measurement_start_utc=args.measurement_start_utc, **options).run()
     result["warmup"] = warmup
     result["valid_run"] = not (invalid(result) or invalid(warmup))
     descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

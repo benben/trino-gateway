@@ -26,7 +26,8 @@ class Transport:
 
 
 class OpenLoopTests(unittest.TestCase):
-    def deterministic_load(self, *, duration=2.5, rate=2, delays=None, statuses=None):
+    def deterministic_load(self, *, duration=2.5, rate=2, delays=None, statuses=None,
+                           measurement_start_utc=None, sleep_overrun=0):
         clock = [100.0]
         delays = iter(delays or [])
         statuses = iter(statuses or [])
@@ -52,13 +53,35 @@ class OpenLoopTests(unittest.TestCase):
                 return status, json.dumps(result).encode()
 
         def advance(seconds):
-            clock[0] += seconds
+            clock[0] += seconds + sleep_overrun
 
         with patch("load_open_loop.ThreadPoolExecutor", InlineExecutor), \
                 patch("load_open_loop.time.monotonic", side_effect=lambda: clock[0]), \
                 patch("load_open_loop.time.sleep", side_effect=advance), \
-                patch("load_open_loop.time.time", return_value=1700000000):
-            return self.run_load(ScriptedTransport(), duration=duration, rate=rate)
+                patch("load_open_loop.time.time", side_effect=lambda: 1700000000 + clock[0] - 100):
+            return self.run_load(ScriptedTransport(), duration=duration, rate=rate,
+                                 measurement_start_utc=measurement_start_utc)
+
+    def test_scheduled_measurement_waits_without_shifting_actual_window(self):
+        result = self.deterministic_load(measurement_start_utc="2023-11-14T22:13:22Z")
+        self.assertEqual(result["planned_window_start_utc"], "2023-11-14T22:13:22.000000Z")
+        self.assertEqual(result["window_start_utc"], result["planned_window_start_utc"])
+        self.assertEqual(result["window_end_utc"], "2023-11-14T22:13:24.500000Z")
+        self.assertEqual(result["measurement_start_drift_seconds"], 0)
+        self.assertEqual(result["counts"]["started_in_window"], 5)
+
+    def test_scheduled_measurement_reports_small_late_start(self):
+        result = self.deterministic_load(measurement_start_utc="2023-11-14T22:13:19.500000Z")
+        self.assertEqual(result["measurement_start_drift_seconds"], .5)
+        self.assertEqual(result["window_start_utc"], "2023-11-14T22:13:20.000000Z")
+
+    def test_scheduled_measurement_rejects_missed_distant_or_non_utc_start(self):
+        for start in ("2023-11-14T22:13:18Z", "2023-11-14T22:23:21Z",
+                      "2023-11-14T22:13:22+00:00", "2023-11-14T22:13:22", "2023-11-14Z", "invalidZ"):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                self.deterministic_load(measurement_start_utc=start)
+        with self.assertRaisesRegex(ValueError, "missed"):
+            self.deterministic_load(measurement_start_utc="2023-11-14T22:13:22Z", sleep_overrun=1.25)
 
     def test_window_telemetry_uses_utc_and_fractional_bucket_rates(self):
         result = self.deterministic_load(statuses=[200, 503, 200, 200, 200])
