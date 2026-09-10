@@ -48,6 +48,23 @@ class LabRenderTests(unittest.TestCase):
         config = next(item for item in self.items if item["kind"] == "Secret" and item["metadata"]["name"] == "gateway-config")
         self.assertIn("jdbc:postgresql://postgres:5432/gateway", config["stringData"]["config.yaml"])
 
+    def test_gateway_image_override_does_not_change_other_resources(self):
+        custom = render(self.namespace, "synthetic-test-password", "print('fixture')", gateway_image="example.invalid/gateway@sha256:" + "a" * 64)["items"]
+        original = next(item for item in self.items if item["kind"] == "Deployment" and item["metadata"]["name"] == "gateway")
+        updated = next(item for item in custom if item["kind"] == "Deployment" and item["metadata"]["name"] == "gateway")
+        self.assertEqual(updated["spec"]["template"]["spec"]["containers"][0]["image"], "example.invalid/gateway@sha256:" + "a" * 64)
+        updated["spec"]["template"]["spec"]["containers"][0]["image"] = original["spec"]["template"]["spec"]["containers"][0]["image"]
+        self.assertEqual(custom, self.items)
+
+    def test_benchmark_backends_have_explicit_resources_and_never_preempt(self):
+        items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True)["items"]
+        for item in items:
+            if item["kind"] == "Deployment":
+                pod = item["spec"]["template"]["spec"]
+                self.assertEqual(pod["preemptionPolicy"], "Never")
+                if item["metadata"]["name"].startswith("fixture-"):
+                    self.assertEqual(pod["containers"][0]["resources"]["requests"], {"cpu": "1", "memory": "512Mi"})
+
     def test_network_is_namespace_scoped_and_real_trino_preserves_proxy_urls(self):
         network = next(item for item in self.items if item["kind"] == "NetworkPolicy")["spec"]
         self.assertEqual(network["podSelector"], {})

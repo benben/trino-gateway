@@ -28,7 +28,7 @@ def validate_extra_fixtures(names):
         raise ValueError("Extra fixture names must be unique DNS labels other than blue or green")
 
 
-def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=()):
+def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=(), gateway_image="trinodb/trino-gateway:21", benchmark=False):
     validate_extra_fixtures(extra_fixtures)
     if extra_fixtures and not fake_source:
         raise ValueError("Extra fixtures require the controlled backend source")
@@ -102,7 +102,7 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
             gateway_config["serverConfig"][client + ".http-client.trust-store-path"] = "/etc/lab-tls/truststore.p12"
             gateway_config["serverConfig"][client + ".http-client.trust-store-password"] = password
     add("Secret", "gateway-config", type="Opaque", stringData={"config.yaml": json.dumps(gateway_config)})
-    deployment("gateway", "trinodb/trino-gateway:21", "500m", "1Gi",
+    deployment("gateway", gateway_image, "500m", "1Gi",
                [{"name": "config", "secret": {"secretName": "gateway-config"}}, {"name": "artifact", "emptyDir": {}}],
                [{"name": "config", "mountPath": "/etc/trino-gateway", "readOnly": True}, {"name": "artifact", "mountPath": "/artifact"}], replicas=2,
                command=["sh", "-c"], args=["exec java -Xmx512m -jar /usr/lib/trino-gateway/gateway-ha-jar-with-dependencies.jar /etc/trino-gateway/config.yaml"])
@@ -130,6 +130,8 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
         config("fake-backend-source", {"fake_trino.py": fake_source})
         for color in ["blue", "green", *extra_fixtures]:
             cpu, memory = ("100m", "128Mi") if color in {"blue", "green"} else ("50m", "64Mi")
+            if benchmark:
+                cpu, memory = "1", "512Mi"
             deployment("fixture-" + color, "python:3.12-alpine", cpu, memory,
                        [{"name": "source", "configMap": {"name": "fake-backend-source"}}],
                        [{"name": "source", "mountPath": "/fixture", "readOnly": True}],
@@ -161,6 +163,10 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
                 item["data"]["config.properties"] += ("http-server.https.enabled=true\nhttp-server.https.port=8443\n"
                                                         f"http-server.https.keystore.path=/etc/lab-tls/{name}.p12\n"
                                                         "http-server.https.keystore.key=${ENV:TLS_STORE_PASSWORD}\n")
+    if benchmark:
+        for item in objects:
+            if item["kind"] == "Deployment":
+                item["spec"]["template"]["spec"]["preemptionPolicy"] = "Never"
     return {"apiVersion": "v1", "kind": "List", "items": objects}
 
 

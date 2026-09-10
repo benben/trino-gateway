@@ -18,6 +18,7 @@ import time
 from render import TASK, password_hash, render, validate_extra_fixtures
 from tls import generate_tls
 from transaction_config import configure_transactions
+from load_config import prepare as prepare_load
 
 
 def upload_artifacts(kubectl, pods, jar):
@@ -51,6 +52,8 @@ def main():
     create.add_argument("--htpasswd", default="htpasswd")
     create.add_argument("--without-real-trino", action="store_true", help="Create only controlled backends for isolated fault tests")
     create.add_argument("--extra-fixture", action="append", default=[])
+    create.add_argument("--gateway-image", default="trinodb/trino-gateway:21", help="Gateway image; use a verified digest for reproducible comparisons")
+    create.add_argument("--benchmark", action="store_true", help="Give controlled backends 1 CPU/512Mi and prohibit pod preemption")
     commands.add_parser("status")
     forward = commands.add_parser("forward", help="Keep loopback forwards running; stop with Ctrl-C")
     forward.add_argument("--base-port", type=int, default=18081)
@@ -63,6 +66,12 @@ def main():
     feature.add_argument("--terminal-retention", type=int, default=2)
     artifact = commands.add_parser("artifact", help="Replace lab Gateway processes with a locally built shaded JAR")
     artifact.add_argument("--jar", type=Path, required=True)
+    load = commands.add_parser("configure-load", help="Configure only an owned external-database benchmark lab")
+    load.add_argument("--database-config", type=Path, required=True, help="Private JSON containing the four PostgreSQL connection fields")
+    load.add_argument("--database-ca", type=Path, required=True)
+    load.add_argument("--database-address", action="append", required=True)
+    load.add_argument("--replicas", type=int, required=True)
+    load.add_argument("--capacity-reviewed", action="store_true", help="Confirm node, memory, IP, and quota headroom before applying")
     delete = commands.add_parser("delete", help="Delete this disposable namespace and all its test data")
     delete.add_argument("--confirm-namespace", required=True)
     args = parser.parse_args()
@@ -104,7 +113,7 @@ def main():
         with os.fdopen(descriptor, "w") as output:
             output.write("TX_TRINO_USER=user\nTX_TRINO_PASSWORD=" + shlex.quote(trino_password) + "\n")
         resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed,
-                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture)
+                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture, gateway_image=args.gateway_image, benchmark=args.benchmark)
         for name, data in [("namespace.json", resources["items"][0]), ("resources.json", resources)]:
             target = runtime / name
             with target.open("x") as output:
@@ -148,6 +157,37 @@ def main():
             raise SystemExit("Deletion requires the exact namespace confirmation")
         kubectl("delete", "namespace", args.namespace, "--wait=false")
         print("Deleted the disposable namespace. Its in-memory and emptyDir test data cannot be recovered.")
+    elif args.command == "configure-load":
+        if not args.capacity_reviewed:
+            raise SystemExit("Review eligible node, memory, pod-IP, and quota capacity before configuring benchmark scale")
+        result = kubectl("-n", args.namespace, "get", "secret", "gateway-config", "-o", "json", capture=True)
+        secret = json.loads(result.stdout)
+        if secret["metadata"].get("labels", {}).get("task") != TASK:
+            raise SystemExit("Refusing an unowned Gateway configuration")
+        config = json.loads(base64.b64decode(secret["data"]["config.yaml"]))
+        updated, network, deployment, quota = prepare_load(config, json.loads(args.database_config.read_text()), args.database_address, args.replicas)
+        certificate = args.database_ca.read_text()
+        if "-----BEGIN CERTIFICATE-----" not in certificate or "PRIVATE KEY" in certificate:
+            raise SystemExit("Expected a public CA certificate bundle, never a private key")
+        secret["data"]["config.yaml"] = base64.b64encode(json.dumps(updated).encode()).decode()
+        secret["metadata"].pop("managedFields", None)
+        secret["metadata"].get("annotations", {}).pop("kubectl.kubernetes.io/last-applied-configuration", None)
+        ca = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "benchmark-database-ca", "namespace": args.namespace,
+              "labels": {"task": TASK}}, "data": {"ca.pem": certificate}}
+        network["metadata"]["namespace"] = args.namespace
+        for resource in (ca, network):
+            response = subprocess.run(base + ["-n", args.namespace, "apply", "-f", "-"], input=json.dumps(resource), text=True,
+                                      capture_output=True, timeout=60)
+            if response.returncode:
+                raise SystemExit("Benchmark network or CA setup failed; no database credentials were printed")
+        response = subprocess.run(base + ["-n", args.namespace, "replace", "-f", "-"], input=json.dumps(secret), text=True,
+                                  capture_output=True, timeout=60)
+        if response.returncode:
+            raise SystemExit("Gateway configuration compare-and-swap failed; inspect the owned lab before retrying")
+        kubectl("-n", args.namespace, "patch", "resourcequota", "lab-budget", "--type=merge", "-p", json.dumps(quota))
+        deployment["spec"]["template"].setdefault("metadata", {})["annotations"] = {"transaction-test/load-config": str(time.time_ns())}
+        kubectl("-n", args.namespace, "patch", "deployment", "gateway", "--type=strategic", "-p", json.dumps(deployment))
+        print("Configured the owned benchmark namespace. Wait for all replicas and verify database identity before measuring load.")
     elif args.command == "artifact":
         jar = args.jar.resolve(strict=True)
         if not jar.is_file() or jar.suffix != ".jar":

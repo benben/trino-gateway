@@ -87,6 +87,11 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                                        "config": dict(state.config)})
                 return
             if path == "/v1/info":
+                with state.lock:
+                    hold_info = state.config.get("hold_info", False)
+                if hold_info and not state.release.wait(30):
+                    self.respond(503, {"error": "Test process-info barrier timed out"})
+                    return
                 self.respond(200, {"nodeVersion": {"version": "test"},
                                    "environment": "test", "coordinator": True,
                                    "nodeId": state.node_id, "coordinatorId": state.coordinator_id,
@@ -170,7 +175,7 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
                 values = json.loads(raw or b"{}")
                 with state.lock:
                     state.config.update(values)
-                    if values.get("hold_start"):
+                    if values.get("hold_start") or values.get("hold_info"):
                         state.release.clear()
                     if values.get("hold_poll"):
                         state.poll_release.clear()

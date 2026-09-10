@@ -100,6 +100,18 @@ class FakeTrinoTests(unittest.TestCase):
         self.assertFalse(task.is_alive())
         self.assertEqual(responses[0].status, 200)
 
+    def test_process_info_barrier_does_not_block_control_endpoint(self):
+        request(self.url + "/__test/config", "POST", '{"hold_info": true}')
+        responses = []
+        task = threading.Thread(target=lambda: responses.append(request(self.url + "/v1/info")))
+        task.start()
+        self.assertTrue(request(self.url + "/__test/state").json()["config"]["hold_info"])
+        self.assertTrue(task.is_alive())
+        request(self.url + "/__test/release", "POST", "{}")
+        task.join(3)
+        self.assertFalse(task.is_alive())
+        self.assertEqual(responses[0].status, 200)
+
     def test_coordinator_identity_matches_query_and_changes_on_restart(self):
         first = request(self.url + "/v1/info").json()
         query = statement(self.url, "SELECT 1").json()["id"]

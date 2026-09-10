@@ -5,6 +5,10 @@ Trino single-node coordinators, and two controllable Python backends. It is for
 synthetic development tests, not customer traffic. The initial Gateway image is
 upstream version 21. Trino is version 483.
 
+Use `--gateway-image` with a verified digest for a reproducible fork baseline.
+The bounded performance workflow and external database safety requirements are
+in [../LOAD.md](../LOAD.md).
+
 The namespace has restricted pod security, no mounted service-account tokens,
 no host privileges, and no public Ingress or load balancer. NetworkPolicy permits
 only same-namespace test traffic and cluster DNS. Resources request 3.5 CPUs and
