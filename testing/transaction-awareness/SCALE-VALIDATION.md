@@ -130,15 +130,42 @@ seventeenth request. A diagnostic repeat received the complete 503 response in
 was relaxed and no further production change was made. The first timeout remains
 unexplained and is not erased by those successful repeats.
 
-Normal, deadline, all-Gateway restart, and Aurora load acceptance are still in
-progress at this checkpoint. No successful 1000-request/second or 100-replica
-capacity claim is established by these results.
+The complete 57-case normal suite subsequently passed, followed by the 500 ms
+deadline regression. The all-Gateway restart test also passed: an open real-Trino
+transaction and an existing continuation survived replacement of both Gateway
+processes. Database and Trino processes, credentials, Gateway image and command,
+replica count, and selected backend were unchanged across that restart.
+
+Aurora load acceptance remains incomplete. No successful 1000-request/second or
+100-replica capacity claim is established by these correctness results.
 
 The repository now includes [database cost measurements](DATABASE_COST.md),
 one-second connection sampling, and aligned HTTP request windows. Their unit
 tests pass. CI also executes the persistent PostgreSQL observer integration test
 against its PostgreSQL service; it does not merely skip that test. These tool
 checks are separate from a measured Aurora load result.
+
+### Aurora baseline calibration failure
+
+The pre-bounding baseline failed its first two-Gateway calibration at 100 target
+HTTP requests/second. During the ten-second measured window, the client scheduled
+1000 requests, started 128, and dropped 872 after reaching its in-flight limit.
+All 128 started requests timed out, with no successful response in that window.
+Warmup also failed and remains part of the invalid-run receipt.
+
+One-second database observations during the measurement showed 83–115 client
+connections, averaging 94.5, with an average of 88.1 waiting on locks. Database
+capacity stayed at 16 ACUs in the surrounding minute. This is evidence of a
+lock-waiting overload, not evidence of successful throughput or an exact unit
+cost. The short window does not establish five-minute I/O attribution.
+
+After requests settled, 245 nonterminal query/result obligations remained on
+the baseline source, with zero pending admissions and open transactions. Those
+records are preserved. A fixed-image comparison must use a clean measured owner
+and compare the exact historical obligation identities before and after each
+case. It must not claim that the historical source drained, or that an inherited
+database and cache form a fresh, controlled baseline comparison. Larger baseline
+matrix cases have not run.
 
 ## Interpretation limits
 
