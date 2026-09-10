@@ -191,8 +191,44 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("measurement_start_utc", runner.call_args_list[0].kwargs)
         self.assertEqual(runner.call_args_list[1].kwargs["measurement_start_utc"], case["measurement_start_utc"])
 
+    def test_explicit_process_profile_reaches_both_phases(self):
+        case = fixture_case()
+        case["client_processes"] = 8
+        result, runner, factory, checkpoint = self.execute(case)
+        self.assertEqual([call.kwargs["processes"] for call in runner.call_args_list], [8, 8])
+        for value in (2, True, "8"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate(dict(case, client_processes=value))
+
 
 class RendererTests(unittest.TestCase):
+    def test_eight_process_case_requires_and_bundles_exact_two_extra_modules(self):
+        import pathlib
+        import sys
+        deploy = pathlib.Path(__file__).resolve().parent / "deploy"
+        sys.path.insert(0, str(deploy))
+        try:
+            from render_load_job import render_job
+            case = fixture_case()
+            case["client_processes"] = 8
+            sources = {name: "source" for name in ("load_open_loop.py", "protocol.py", "load_checkpoints.py",
+                                                   "matrix_case.py", "load_multiprocess.py", "load_aggregate.py")}
+            priority = {"metadata": {"name": "test-low", "labels": {"task": "gateway-transaction-awareness"}},
+                        "value": -10, "globalDefault": False, "preemptionPolicy": "Never"}
+            options = dict(priority_class=priority, admin_secret="existing-admin", admin_secret_key="token")
+            result = compose(render_job, "gateway-tx-lab-test", "load-test", case, sources,
+                             "-----BEGIN CERTIFICATE-----\nfixture", **options)
+            self.assertEqual(set(result["items"][0]["data"]), set(sources) | {"case.json", "ca.pem"})
+            self.assertEqual(result["items"][1]["spec"]["template"]["spec"]["containers"][0]["command"],
+                             ["python", "/source/matrix_case.py"])
+            for missing in ("load_multiprocess.py", "load_aggregate.py"):
+                with self.subTest(missing=missing), self.assertRaises(ValueError):
+                    compose(render_job, "gateway-tx-lab-test", "load-test", case,
+                            {key: value for key, value in sources.items() if key != missing},
+                            "-----BEGIN CERTIFICATE-----\nfixture", **options)
+        finally:
+            sys.path.remove(str(deploy))
+
     def test_composition_preserves_scope_and_secret_references(self):
         def renderer(*args, **kwargs):
             return {"items": [{"kind": "ConfigMap", "data": {"ca.pem": "public"}},

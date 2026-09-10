@@ -37,6 +37,18 @@ class LoadJobTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.render(**options)
 
+    def test_eight_process_bundle_is_explicit_and_complete(self):
+        sources = {"load_multiprocess.py": "worker source", "load_aggregate.py": "aggregate source"}
+        objects = self.render(processes=8, process_sources=sources)["items"]
+        self.assertEqual(set(objects[0]["data"]), set(sources) | {"load_open_loop.py", "ca.pem"})
+        container = objects[1]["spec"]["template"]["spec"]["containers"][0]
+        self.assertIn("--processes", container["args"])
+        self.assertIn("sys.path.insert", container["command"][-1])
+        for options in ({"processes": 8}, {"processes": 2}, {"process_sources": sources},
+                        {"processes": 8, "process_sources": sources, "concurrency": 127}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.render(**options)
+
     def test_rejects_missing_or_preempting_priority(self):
         for priority in (None, {"metadata": {"name": "default"}, "value": 0}):
             with self.subTest(priority=priority), self.assertRaises(ValueError):

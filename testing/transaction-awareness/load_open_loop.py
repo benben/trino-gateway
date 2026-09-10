@@ -205,18 +205,27 @@ class VerifiedNameConnection(http.client.HTTPSConnection):
 class OpenLoop:
     def __init__(self, gateways, groups, authorization, *, rate, duration, concurrency=128,
                  timeout=10, maximum_lag=.05, transport=None, expected_backends=None,
-                 measurement_start_utc=None):
+                 measurement_start_utc=None, processes=1):
         if not gateways or not groups or not authorization:
             raise ValueError("Explicit gateways, routing groups, and runtime authorization are required")
         if not 1 <= rate <= 10000 or not 0 < duration <= 600 or rate * duration > 1_000_000:
             raise ValueError("Keep each run bounded to at most one million requests and ten minutes")
         if not 1 <= concurrency <= 512 or not 0 < timeout <= 120 or maximum_lag <= 0:
             raise ValueError("Invalid bounded client resource or timeout settings")
+        if type(processes) is not int or processes not in (1, 8):
+            raise ValueError("Use one or eight client processes")
+        if processes == 8 and (type(rate) is not int or rate not in (100, 1000) or
+                               type(concurrency) is not int or concurrency % 8 or transport is not None or
+                               not math.isfinite(duration) or int(rate * duration) < 8 or
+                               not math.isfinite(timeout) or not math.isfinite(maximum_lag)):
+            raise ValueError("Eight processes require a supported aggregate rate, divisible capacity, and independent transports")
+        self.processes = processes
+        self.rotation_offset = 0
         self.gateways, self.groups, self.authorization = gateways, groups, authorization
         self.rate, self.duration, self.concurrency = rate, duration, concurrency
         self.timeout = timeout
         self.maximum_lag = maximum_lag
-        self.transport = transport or Connections(gateways, timeout)
+        self.transport = transport or (Connections(gateways, timeout) if processes == 1 else None)
         self.expected_backends = expected_backends or {}
         self.measurement_start = None
         if measurement_start_utc is not None:
@@ -266,10 +275,10 @@ class OpenLoop:
                 self.counts["sql_submissions"] += 1
             headers = {"Authorization": self.authorization, "X-Trino-User": "user",
                        "X-Trino-Transaction-Id": "NONE", "Content-Type": "text/plain",
-                       "X-Trino-Routing-Group": self.groups[sql_sequence % len(self.groups)]}
+                       "X-Trino-Routing-Group": self.groups[(sql_sequence + self.rotation_offset) % len(self.groups)]}
             expected_backend = self.expected_backends.get(headers["X-Trino-Routing-Group"])
         with self.lock:
-            index = (self.method_counts[method] + (1 if method == "GET" else 0)) % len(self.gateways)
+            index = (self.method_counts[method] + self.rotation_offset + (1 if method == "GET" else 0)) % len(self.gateways)
             self.method_counts[method] += 1
         status, payload, error, response_category = None, None, None, None
         try:
@@ -317,14 +326,20 @@ class OpenLoop:
                         if row and isinstance(row[0], str):
                             self.backend_rows[row[0]] += 1
 
-    def run(self):
+    def run(self, *, _phase=None):
+        if self.processes == 8:
+            from load_multiprocess import run_multiprocess
+            return run_multiprocess(self)
         permit = threading.BoundedSemaphore(self.concurrency)
-        cpu_snapshots = {"before_setup": read_client_cpu()}
+        cpu_snapshots = {"before_setup": read_client_cpu()} if _phase is None else None
         setup_beginning = time.monotonic()
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             prepare_workers(executor, self.concurrency)
             setup_elapsed = time.monotonic() - setup_beginning
-            if self.measurement_start is not None:
+            if _phase is not None:
+                beginning, window_start_utc, start_drift = _phase.start(setup_elapsed)
+                self.rotation_offset = _phase.process_index
+            elif self.measurement_start is not None:
                 delay = self.measurement_start.timestamp() - time.time()
                 if delay > 600:
                     raise ValueError("Measurement start must be at most 600 seconds away after warmup")
@@ -332,16 +347,21 @@ class OpenLoop:
                     raise ValueError("Scheduled measurement start was missed by more than one second")
                 if delay > 0:
                     time.sleep(delay)
-            cpu_snapshots["before_workload"] = read_client_cpu()
-            beginning = time.monotonic()
-            window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
-            start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
+            if _phase is None:
+                cpu_snapshots["before_workload"] = read_client_cpu()
+                beginning = time.monotonic()
+                window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
+                start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
             if start_drift is not None and abs(start_drift) > 1:
                 raise ValueError("Scheduled measurement start was missed or the UTC clock changed")
             cpu_beginning = time.process_time()
             end = beginning + self.duration
             self.window_beginning, self.window_end = beginning, end
-            planned = int(self.rate * self.duration)
+            sequences = range(int(self.rate * self.duration)) if _phase is None else range(
+                _phase.process_index, int(_phase.global_rate * self.duration), 8)
+            planned = len(sequences)
+            schedule_rate = self.rate if _phase is None else _phase.global_rate
+            futures = []
 
             def worker(sequence, scheduled):
                 try:
@@ -351,8 +371,8 @@ class OpenLoop:
                         self.inflight -= 1
                     permit.release()
 
-            for sequence in range(planned):
-                scheduled = beginning + sequence / self.rate
+            for sequence in sequences:
+                scheduled = beginning + sequence / schedule_rate
                 delay = scheduled - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
@@ -365,10 +385,17 @@ class OpenLoop:
                 with self.lock:
                     self.inflight += 1
                     self.peak_inflight = max(self.peak_inflight, self.inflight)
-                executor.submit(worker, sequence, scheduled)
+                future = executor.submit(worker, sequence, scheduled)
+                if _phase is not None:
+                    futures.append(future)
+        for future in futures:
+            future.result()
         measured_elapsed = time.monotonic() - beginning
         cpu_elapsed = time.process_time() - cpu_beginning
-        cpu_snapshots["after_completion"] = read_client_cpu()
+        if _phase is None:
+            cpu_snapshots["after_completion"] = read_client_cpu()
+        else:
+            _phase.complete(measured_elapsed, cpu_elapsed)
         cleanup_deadline = time.monotonic() + min(120, max(30, self.timeout * 2))
         for sequence in range(planned, planned + self.concurrency * 20):
             if time.monotonic() >= cleanup_deadline:
@@ -385,10 +412,11 @@ class OpenLoop:
             rates = [bucket[event] / bucket["duration_seconds"] for bucket in self.second_buckets]
             request_rates[event] = dict(min=min(rates), max=max(rates),
                                         avg=sum(bucket[event] for bucket in self.second_buckets) / self.duration)
-        return {"scheduled_http_requests": planned, "target_http_rps": self.rate,
+        return {**({"final_inflight": self.inflight} if _phase is not None else {}),
+                "scheduled_http_requests": planned, "target_http_rps": self.rate,
                 "client_setup_seconds": setup_elapsed,
                 "client_setup_method": "all executor workers started before the window; no backend traffic",
-                "client_cgroup_cpu": client_cpu_diagnostics(cpu_snapshots),
+                "client_cgroup_cpu": client_cpu_diagnostics(cpu_snapshots) if cpu_snapshots else None,
                 "window_start_utc": window_start_utc.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "window_end_utc": (window_start_utc + timedelta(seconds=self.duration)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "planned_window_start_utc": None if self.measurement_start is None else self.measurement_start.isoformat(timespec="microseconds").replace("+00:00", "Z"),
@@ -416,6 +444,7 @@ def main():
     parser.add_argument("--rate", type=int, required=True, help="Aggregate scheduled HTTP requests per second, not SQL queries")
     parser.add_argument("--duration", type=float, default=60)
     parser.add_argument("--concurrency", type=int, default=128)
+    parser.add_argument("--processes", type=int, choices=(1, 8), default=1)
     parser.add_argument("--timeout", type=float, default=10)
     parser.add_argument("--warmup", type=float, default=10)
     parser.add_argument("--measurement-start-utc", help="Optional ISO 8601 Z start after warmup, at most 600 seconds away")
@@ -429,11 +458,18 @@ def main():
     expected = json.loads(os.environ.get("TX_LOAD_EXPECTED_BACKENDS", "{}"))
     if args.warmup < 0 or args.warmup > 60:
         parser.error("Warmup must be between zero and sixty seconds")
-    options = dict(rate=args.rate, concurrency=args.concurrency, timeout=args.timeout, expected_backends=expected)
+    options = dict(rate=args.rate, concurrency=args.concurrency, timeout=args.timeout, expected_backends=expected,
+                   processes=args.processes)
     authorization = os.environ.get("TX_QUERY_AUTHORIZATION", "")
     warmup = OpenLoop(gateways, groups, authorization, duration=args.warmup, **options).run() if args.warmup else None
-    result = OpenLoop(gateways, groups, authorization, duration=args.duration,
-                      measurement_start_utc=args.measurement_start_utc, **options).run()
+    if args.processes == 8 and invalid(warmup):
+        result = {"measurement_not_started": True, "errors": {"invalid_warmup": 1},
+                  "client_processes": 8, "client_bottleneck_detected": True,
+                  "unconsumed_continuations": None, "offered_http_rps": None, "achieved_http_rps": None,
+                  "successful_http_rps": None, "latency_ms": None}
+    else:
+        result = OpenLoop(gateways, groups, authorization, duration=args.duration,
+                          measurement_start_utc=args.measurement_start_utc, **options).run()
     result["warmup"] = warmup
     result["valid_run"] = not (invalid(result) or invalid(warmup))
     descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

@@ -10,6 +10,11 @@ def compose(renderer, namespace, name, case, sources, ca_certificate, *, priorit
             admin_secret, admin_secret_key):
     validate(case)
     expected = {"load_open_loop.py", "protocol.py", "load_checkpoints.py", "matrix_case.py"}
+    process_options = {}
+    if case.get("client_processes", 1) == 8:
+        additional = {"load_multiprocess.py", "load_aggregate.py"}
+        expected |= additional
+        process_options = {"processes": 8, "process_sources": {name: sources.get(name) for name in additional}}
     if set(sources) != expected or any(not isinstance(source, str) or not source for source in sources.values()):
         raise ValueError("Bundle the reviewed load, TLS protocol, checkpoint, and wrapper sources")
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", admin_secret) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,253}", admin_secret_key):
@@ -19,7 +24,7 @@ def compose(renderer, namespace, name, case, sources, ca_certificate, *, priorit
                         rate=case["rate"], duration=case["duration"], warmup=case["warmup"],
                         expected_backends={group["name"]: group["source_identity"] for group in case["groups"]},
                         concurrency=case.get("concurrency", 128), priority_class=priority_class,
-                        measurement_start_utc=case.get("measurement_start_utc"))
+                        measurement_start_utc=case.get("measurement_start_utc"), **process_options)
     config, job = rendered["items"]
     if config["kind"] != "ConfigMap" or job["kind"] != "Job":
         raise ValueError("Unexpected renderer output")

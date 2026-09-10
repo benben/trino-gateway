@@ -53,6 +53,9 @@ def validate(case):
         raise ValueError("Case is outside the approved bounded matrix")
     if type(case.get("concurrency", 128)) is not int or not 1 <= case.get("concurrency", 128) <= 512:
         raise ValueError("Invalid client concurrency")
+    processes = case.get("client_processes", 1)
+    if type(processes) is not int or processes not in (1, 8) or (processes == 8 and case.get("concurrency", 128) % 8):
+        raise ValueError("Use one or eight processes with divisible aggregate capacity")
 
 
 @contextmanager
@@ -76,6 +79,8 @@ def run(case, authorization, admin_token, runner, checkpoint_factory, is_invalid
     groups = [group["name"] for group in case["groups"]]
     options = dict(rate=case["rate"], concurrency=case.get("concurrency", 128), timeout=10,
                    expected_backends={group["name"]: group["source_identity"] for group in case["groups"]})
+    if case.get("client_processes", 1) == 8:
+        options["processes"] = 8
     result = {"case_id": case["case_id"], "image_digest": case["image_digest"], "source_commit": case["source_commit"],
               "replicas": case["replicas"], "rate": case["rate"], "valid_run": False, "workload_checks_passed": False,
               "external_postguard_required": True, "checkpoints": [], "stages": [], "started_utc": utc()}
