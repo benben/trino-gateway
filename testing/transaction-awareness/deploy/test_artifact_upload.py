@@ -62,6 +62,24 @@ class ArtifactUploadTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertNotIn("mv", [item for call in calls for item in call])
 
+    def test_slow_upload_timeout_is_explicit_and_bounded(self):
+        with tempfile.TemporaryDirectory(prefix="gateway-artifact-test-") as directory:
+            jar = Path(directory) / "test.jar"
+            jar.write_bytes(b"test artifact bytes")
+            expected = hashlib.sha256(jar.read_bytes()).hexdigest()
+            timeouts = []
+
+            def kubectl(*parts, **options):
+                if parts[0] == "cp":
+                    timeouts.append(options["timeout"])
+                return CompletedProcess([], 0, expected)
+
+            upload_artifacts(kubectl, ["gateway-test"], jar, timeout=900)
+            self.assertEqual(timeouts, [900])
+            for timeout in [0, 901, True]:
+                with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                    upload_artifacts(kubectl, ["gateway-test"], jar, timeout=timeout)
+
 
 if __name__ == "__main__":
     unittest.main()

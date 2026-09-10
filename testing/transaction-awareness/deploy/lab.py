@@ -21,7 +21,9 @@ from transaction_config import configure_transactions
 from load_config import prepare as prepare_load
 
 
-def upload_artifacts(kubectl, pods, jar):
+def upload_artifacts(kubectl, pods, jar, timeout=300):
+    if type(timeout) is not int or not 60 <= timeout <= 900:
+        raise ValueError("Artifact upload timeout must be between 60 and 900 seconds")
     digest = hashlib.sha256()
     with jar.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -29,7 +31,7 @@ def upload_artifacts(kubectl, pods, jar):
     expected = digest.hexdigest()
 
     def upload(pod):
-        kubectl("cp", str(jar), f"{pod}:/artifact/upload.jar", "-c", "gateway", timeout=300)
+        kubectl("cp", str(jar), f"{pod}:/artifact/upload.jar", "-c", "gateway", timeout=timeout)
         result = kubectl("exec", pod, "-c", "gateway", "--", "sha256sum", "/artifact/upload.jar", capture=True)
         if not result.stdout.split() or result.stdout.split()[0] != expected:
             raise RuntimeError("Uploaded lab artifact checksum did not match")
@@ -66,6 +68,7 @@ def main():
     feature.add_argument("--terminal-retention", type=int, default=2)
     artifact = commands.add_parser("artifact", help="Replace lab Gateway processes with a locally built shaded JAR")
     artifact.add_argument("--jar", type=Path, required=True)
+    artifact.add_argument("--upload-timeout", type=int, default=300, help="Bound each upload to 60-900 seconds")
     load = commands.add_parser("configure-load", help="Configure only an owned external-database benchmark lab")
     load.add_argument("--database-config", type=Path, required=True, help="Private JSON containing the four PostgreSQL connection fields")
     load.add_argument("--database-ca", type=Path, required=True)
@@ -189,6 +192,8 @@ def main():
         kubectl("-n", args.namespace, "patch", "deployment", "gateway", "--type=strategic", "-p", json.dumps(deployment))
         print("Configured the owned benchmark namespace. Wait for all replicas and verify database identity before measuring load.")
     elif args.command == "artifact":
+        if not 60 <= args.upload_timeout <= 900:
+            raise SystemExit("Artifact upload timeout must be between 60 and 900 seconds")
         jar = args.jar.resolve(strict=True)
         if not jar.is_file() or jar.suffix != ".jar":
             raise SystemExit("Expected a locally built shaded .jar artifact")
@@ -207,7 +212,7 @@ def main():
             time.sleep(1)
         if len(pods) != expected:
             raise SystemExit("Timed out waiting for isolated Gateway upload pods; no artifact was published")
-        upload_artifacts(lambda *parts, **options: kubectl("-n", args.namespace, *parts, **options), pods, jar)
+        upload_artifacts(lambda *parts, **options: kubectl("-n", args.namespace, *parts, **options), pods, jar, timeout=args.upload_timeout)
         print("Artifact uploaded only to lab emptyDir volumes. Reopen forwards after pod replacement.")
     elif args.command == "forward":
         validate_extra_fixtures(args.extra_fixture)

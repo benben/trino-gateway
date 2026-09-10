@@ -93,6 +93,9 @@ upload anything to a registry. Reopen port-forwards afterwards. The helper
 uses at most two concurrent uploads, verifies each SHA-256 digest, and renames
 each verified file atomically before starting Java. A replacement
 pod loses its uploaded artifact; repeat the artifact command after replacement.
+For a slow development connection, `--upload-timeout 900` extends the default
+300-second bound. The helper rejects values outside 60-900 seconds. Do not run
+multiple labs' uploads concurrently when the connection is already saturated.
 Use this destructive lab operation only between test runs, not as a model of a
 production rolling deployment.
 
