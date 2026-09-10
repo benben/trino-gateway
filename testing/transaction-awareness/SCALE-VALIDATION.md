@@ -35,7 +35,8 @@ No ledger deletion or uncertainty expiry is part of this change.
 
 ## Completed candidate checks
 
-The integrated Java command ran 210 tests with zero failures, errors or skips:
+The integrated Java command ran 210 tests with zero failures, errors or skips.
+After the test-only pooled-completion addition, it passed all 211 tests:
 
 ```sh
 ./mvnw -B -ntp -pl gateway-ha -am test \
@@ -52,6 +53,17 @@ Coverage includes real JDBC statement cancellation and rollback, a completion
 connection left available under admission pressure, pool shutdown, bounded
 completion workers and queue, cancellation detachment, callback-binding failure,
 synchronous transport failure, duplicate permit release and feature-disabled paths.
+
+The additional integration case uses the actual service, proxy completion callback,
+Hikari pool and PostgreSQL ledger with a controlled asynchronous upstream transport.
+It records a terminal response after client timeout while three admission
+connections remain occupied, and observes exactly four pooled PostgreSQL sessions.
+It does not replace network or multi-process tests.
+
+The integrated Python fixtures, fault proxy and open-loop scheduler passed 36
+self-tests. The disposable deployment helpers passed 23 checks. The scheduler's
+tests cover routing-group and per-method replica distribution, rejected requests,
+client scheduling drops and invalid warmups.
 
 Two upstream proxy suites require Docker and could not run on the local host.
 The full CI matrix must cover them; this receipt does not count their setup errors
