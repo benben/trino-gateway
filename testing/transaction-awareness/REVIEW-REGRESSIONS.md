@@ -1,34 +1,39 @@
-# Regressions found during implementation review
+# Targeted review regression oracles
 
-Date: 2026-09-09. These are additional red tests against earlier implementation
-checkpoints, not the original upstream baseline. See [BASELINE.md](BASELINE.md)
-for the pre-implementation evidence. Private runtime output remains outside Git.
+Use focused regressions to test each safety invariant without letting another
+validation failure mask it. Keep execution outcomes and mutation-test receipts
+private. These oracles complement the complete verification procedure in
+[VALIDATION.md](VALIDATION.md).
 
-| Gap | Genuine red result | Required correction |
-| --- | --- | --- |
-| Unknown result capability reaches a backend | Four live HTTP tests: three forged GET/HEAD/DELETE failures, one valid replay control passed | Persist advertised paths before client exposure and reject unknown paths before dispatch |
-| Legacy API hides lifecycle conflict as HTTP 404 | Four resource tests: two failures, two ordinary-404 controls passed | Preserve the deliberate HTTP 409 response |
-| Duplicate JSON fields can hide a continuation or overwrite identity | 74 adapter tests: four failures, 70 controls passed | Reject duplicate fields before any ledger operation |
-| Missing continuation with a nonterminal or missing state appears complete | 83 adapter tests: seven failures, 76 controls passed | Require FINISHED or FAILED when no continuation remains |
-| A resume prepared before sealing can succeed after sealing | 39 PostgreSQL tests: two failures, 37 controls passed | Advance generation on sealing; reject stale lifecycle requests |
-| Acknowledged cancellation leaves unnecessary permanent uncertainty | 90 adapter tests: three failures, 87 controls passed | Settle only the bound DELETE request; preserve query, transaction and retention state |
+| Invariant | Required oracle |
+| --- | --- |
+| Unknown result capability cannot reach a backend | Pair forged GET, HEAD, and DELETE requests with a valid advertised-replay control and inspect backend dispatch |
+| Deliberate lifecycle conflict remains HTTP 409 | Exercise legacy activation conflicts and ordinary missing-backend responses separately |
+| Duplicate JSON cannot overwrite identity or continuation state | Use otherwise valid terminal responses and reject duplicate fields before any ledger mutation |
+| Missing continuation does not imply completion | Require FINISHED or FAILED when no continuation remains; reject missing or nonterminal state |
+| Stale lifecycle commands cannot undo sealing | Race commands with the same observed generation and verify sealing advances that generation |
+| Acknowledged cancellation settles only its request | Preserve the query, transaction, concurrent request, and retention obligations after DELETE 204 |
+| Servlet recycling cannot lose completion context | Recycle the servlet at response delivery and timeout; verify stable admission and lease handling |
+| Independent queries can progress concurrently | Hold one query's database fence and verify unrelated work can complete while that fence remains held |
+| Conflicting callbacks cannot overwrite one another | Block one callback after it acquires its admission fence and verify a conflicting callback waits and rejects |
+| One replica's recovery does not imply fleet recovery | Delay another replica's database response and require every replica within one shared deadline |
 
-The terminal-state invariant was checked against Trino tag 483. Executing results
-omit their continuation only for a failed query or final query information.
-Final query information requires a done state. Queued results retain their
-continuation unless dispatch failed. The only done states are FINISHED and FAILED.
-The reverse implication is invalid: FINISHED results can still have a continuation
-for buffered data or acknowledgment.
+## Protocol details
 
-The generation regression includes concurrent seal/resume attempts using the
-same observed generation. Exactly one may succeed. A fresh, intentional resume
-after sealing remains possible; the external deployment controller must serialize
-that decision with stopping the coordinator.
+Trino can retain a continuation for buffered data or acknowledgment even when
+its state is FINISHED. Do not apply the reverse implication that every FINISHED
+response is terminal for Gateway accounting. Consult the matching Trino source
+when adding or changing protocol states.
 
-These targeted receipts do not replace the final multi-process acceptance run.
+A fresh intentional resume after sealing is different from a stale resume
+prepared before sealing. The deployment controller must serialize a new resume
+decision with stopping or replacing the coordinator.
 
-After adding terminal-state validation, the four duplicate-field fixtures were
-strengthened to end with an otherwise valid FINISHED state. A mutation run that
-removed duplicate detection still failed all four cases; restoring it passed all
-83 adapter cases at that checkpoint. Another validation must not mask the parser
-regression.
+For duplicate-field parser tests, use a valid final state so terminal-state
+validation cannot mask missing duplicate detection. A targeted mutation should
+disable only the validation under review; restore the implementation before
+running the full verification gates.
+
+Test identity hash collisions without treating colliding strings as the same
+query or transaction. Query and transaction lock namespaces must remain separate
+so collisions cannot reverse the global lock acquisition order.

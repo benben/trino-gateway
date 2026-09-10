@@ -1,103 +1,80 @@
-# Transaction-awareness validation receipt
+# Transaction-awareness verification checklist
 
-Date: 2026-09-09. This validates the supported routing protocol in disposable
-environments. It is not production deployment approval or a performance benchmark.
+This document defines verification procedures and scope, not an execution
+receipt. Keep all deployment and test results, including sanitized summaries,
+in private artifacts shared directly with the operator.
 
-## Tested implementation
+## Bind verification to an implementation
 
-The final implementation checkpoint is `5920d79`. Its shaded Gateway artifact
-has SHA-256:
+Record the source revision, immutable image digest, runtime configuration,
+database engine, and fixture identities privately. Verify the running image
+through every Gateway process rather than relying only on a deployment manifest.
+If production code changes, identify and rerun the affected verification gates.
 
-```text
-8e3a4ac72ca983f7186327ebb67a4696011f35903df54b0e863016f7d49ec583
+Run repository formatting, compilation, unit tests, and container-dependent
+checks. Use a real PostgreSQL fixture for ledger concurrency and migrations.
+Mock-only tests do not establish database locking or multi-process correctness.
+
+## Required coverage
+
+| Area | Required assertions |
+| --- | --- |
+| Identity and parsing | Reject unknown ownership, conflicting headers, malformed paths, duplicate JSON fields, and forged capabilities before unsafe forwarding |
+| Ledger | Preserve atomic binding, callback idempotence, rollback on failure, concurrent admission ordering, and historical incarnation identity |
+| Bootstrap | Preserve feature-disabled behavior and initialize the enabled dependency graph and database migrations |
+| HTTP protocol | Retain transaction and result ownership across independent Gateway processes and backend cutover |
+| Lifecycle | Keep pending work and open transactions as drain blockers; enforce generation checks and atomic sealing |
+| Cancellation | Settle only an acknowledged cancellation request while preserving its query and transaction obligations |
+| Faults | Retain uncertainty after database loss, response loss, ambiguous outcomes, and coordinator identity changes |
+| Real clients | Preserve original protocol URLs, verified TLS, transaction affinity, and commit/rollback behavior with a supported client |
+| Process replacement | Retain durable ownership and pre-existing result capabilities after replacing every Gateway process |
+
+## Ordered disposable-lab runs
+
+Use distinct Gateway process endpoints. Register independent backend processes
+with different identities. Normal and irreversible-fault suites need separate
+databases and credentials; an uncertain fault ledger is not a clean normal fixture.
+
+```sh
+cd testing/transaction-awareness
+python3 run_contracts.py --suite normal --list
+python3 run_contracts.py --suite normal
+python3 run_contracts.py --suite fault
+python3 run_contracts.py --suite real
 ```
 
-The reproducible ordered runner and strengthened restart harness are in
-`4f2115e`. No production Java changes followed the implementation checkpoint.
-The implementation checkpoint passed full CI: Docker and Maven on Java 25, 26,
-and 27-ea, plus the dedicated PostgreSQL transaction workflow.
+Complete the native client procedure in [client/README.md](client/README.md).
+Run the all-Gateway restart harness only after other tests using that lab finish.
+It must verify changed Gateway process identities and unchanged database,
+coordinator, configuration, credential, image, and replica snapshots.
 
-## Executed checks
+For database outages, check recovery through every Gateway under one bounded
+deadline before continuing the original transaction assertion. Preserve both
+the no-forward assertion during the outage and the owner-affinity assertion
+after recovery. Do not substitute an unrelated successful query for either.
 
-| Check | Result |
-| --- | --- |
-| Focused Java adapter, identity, configuration, legacy-resource and strict-response checks | 108 passed |
-| Real PostgreSQL ledger checks, including concurrent operations and result-capability persistence | 40 passed |
-| Full production-module bootstrap with the feature enabled and disabled | 2 passed |
-| Python protocol and TCP fault-fixture self-tests | 27 passed |
-| Disposable deployment and restart safety checks | 17 passed |
-| Normal multi-process HTTP contract | 57 passed in 1312.159 seconds |
-| Capability and irreversible-fault contract | 20 passed in 486.127 seconds |
-| Real Trino HTTP contract after replacing all Gateways | 5 passed in 211.030 seconds |
-| Unmodified JDBC 483 transaction cutover | Passed through both Gateway replicas |
-| All-Gateway process replacement | Open transaction and pre-existing query continuation both survived |
-
-These counts describe separate suites, not one combined invocation. The normal
-57-test run used the preceding `da3a5d4` artifact, SHA-256
-`fcf43886557d3f3b7568c38451ab22d787df58dfd61d40a6c7cfd6842aa1d6b1`.
-The only subsequent production change narrowed successful DELETE accounting:
-HTTP 204 settles its request without completing its query or transaction. The
-20-test fault suite, real-client checks, and Gateway replacement used the final
-artifact. The fault suite explicitly tests this refinement and a concurrent poll.
-
-The original upstream failures are recorded in [BASELINE.md](BASELINE.md).
-Additional genuine red tests and mutation evidence are recorded in
-[REVIEW-REGRESSIONS.md](REVIEW-REGRESSIONS.md). No expected-failure annotations
-were used to turn the acceptance runs green.
-
-## Live topology and observations
-
-The normal lab used two independent Gateway pods sharing PostgreSQL, two
-controlled backends in one routing group, a third independent backend in another
-group, and two stock Trino 483 coordinators with TPCH catalogs. A separate fault
-lab had its own two Gateways, PostgreSQL, controlled backends and TCP fault proxy.
-Clients and Gateway-to-Trino connections verified TLS with a private test CA.
-Credentials and infrastructure addresses stayed outside the public repository.
-
-The normal run exercised transaction affinity, ownership rejection, lifecycle
-headers on continuation pages, replay, idle transactions, admission/drain races,
-generation fencing, malformed paths, heartbeat handling and result capabilities.
-It changed the routing-group input while existing transactions retained their
-owner. It also completed three blue/green reincarnation cycles without rebinding
-old query IDs to replacement processes. This simulates placement changes; it does
-not implement tenant provisioning or migrate warehouse data.
-
-The fault run exercised database loss before admission and after backend
-acceptance, cancellation races, stage cancellation, malformed and duplicate JSON,
-conflicting lifecycle headers, lost responses, ambiguous HTTP 408 responses and
-coordinator identity replacement. Every injected ambiguous outcome retained a
-drain blocker. Database connectivity was restored after each outage. The fault
-lab intentionally ended with unresolved ledger state; it was not declared clean
-or safely drained.
-
-The restart harness replaced every Gateway pod and verified different pod UIDs,
-unchanged PostgreSQL and Trino pod identities/restart counts, and unchanged
-credential/configuration Secret data. A query issued before replacement delivered
-its expected result afterward through a persisted capability. The open transaction
-then worked through both new Gateways and committed. This demonstrates persistent
-ownership, not uninterrupted request availability while every Gateway is down.
-
-Native JDBC tests used the standard driver without URL rewriting or an encoding
-override. New connections reached the replacement coordinator while the existing
-transaction stayed on its original coordinator. Separate HTTP tests exercised
-requests across individually addressed Gateway replicas.
+See [BASELINE.md](BASELINE.md) for baseline comparisons and
+[REVIEW-REGRESSIONS.md](REVIEW-REGRESSIONS.md) for targeted regression oracles.
 
 ## Boundaries
 
-See [OPERATIONS.md](OPERATIONS.md) for the full contract. Important exclusions are:
+See [OPERATIONS.md](OPERATIONS.md) for the supported protocol and operational
+contract. Important exclusions are:
 
-- Stable Basic credentials and inline results are the supported initial mode.
-- Coordinator loss still loses its in-memory transactions. Gateway does not
-  provide transaction replication or exactly-once execution. Query or transaction
-  failure after coordinator loss is explicitly accepted and outside this scope.
+- Stable Basic credentials and inline results are the initial supported mode.
+- Coordinator loss still loses in-memory transactions. Gateway does not provide
+  transaction replication or exactly-once execution.
 - Ambiguous outcomes and indefinitely open transactions can block retirement
   indefinitely. Automatic coordinator-side reconciliation is not implemented.
 - Result affinity has a finite retry window; response bodies are not durably
   replayed forever.
-- Database failover, six-replica load, production performance, DuckLake connector
-  write semantics, tenant authorization/provisioning and warehouse data movement
-  were not validated by these tests.
-- Mixed feature-disabled or older prototype replicas are outside the guarantee.
+- Placement-header tests do not establish tenant provisioning, tenant
+  authorization, warehouse data movement, or connector write semantics.
+- Database failover and capacity claims require their own representative tests.
+- Passing process-replacement assertions does not establish uninterrupted
+  availability while all Gateway processes are stopped.
+- Mixed-version compatibility needs explicit tests; do not infer it from
+  single-version verification.
 
-No production packaging, image publication, DNS, IAM or production deployment
-was performed for this implementation exercise.
+Correctness verification does not establish a throughput target. Follow
+[SCALE-VALIDATION.md](SCALE-VALIDATION.md) for resource and concurrency checks.

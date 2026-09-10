@@ -1,7 +1,8 @@
 # Bounded load and deadline regressions
 
 Use only an explicitly authorized disposable lab. Keep endpoints, credentials,
-generated manifests, and raw results outside this public repository.
+generated manifests, and all results outside this public repository. Do not
+publish sanitized benchmark summaries or internal analytics in public comments.
 
 See [database measurements and cost estimates](DATABASE_COST.md) for aligned
 request rates, connection samples, ACUs, idle baselines, and cost attribution.
@@ -126,18 +127,15 @@ namespace memory quota from rendered requests and replicas, adds 1 GiB
 headroom, and retains a 16 GiB minimum and 140 GiB maximum. It does not widen
 CPU or pod-count quotas, or prove that eligible nodes can fit these requests.
 
-The fixture intentionally retains query results and request history. A local
-synthetic replay through its actual HTTP parser and handlers retained 150,000
-queries and 300,000 HTTP requests, without sockets or Gateway processes.
-CPython 3.9 and 3.13 measured approximately 434–522 MiB of retained Python
-objects, 505–599 MiB process peak RSS before history export, and 591–730 MiB
-including export. These are local allocator/platform observations, not exact
-container predictions. A 512 MiB fixture cannot safely represent the hot
-five-minute 1,000 HTTP-request/second case. The number of Gateway replicas
-does not multiply these request counts, but live connections add overhead.
+The fixture intentionally retains query results and request history. Account
+for the complete matrix, warmups, reruns, live connections, and history export
+when selecting its memory limit. Python allocator and platform differences make
+local memory estimates insufficient to establish container headroom. The number
+of Gateway replicas does not multiply the aggregate scheduled request count,
+but additional connections and background monitors add overhead.
 
-The 8 GiB allocation provides estimated headroom for the bounded matrix,
-warmups, and history serialization. Use identical resources for both images.
+Use identical resources for both images. A configured memory allowance is not
+evidence that the full workload fits or that the fixture cannot be a bottleneck.
 Monitor actual memory and account for accumulated queries before adding reruns;
 do not silently discard history, evict query results, or reset an uncertain
 fixture to make a failed run pass. Query IDs use a locked per-incarnation

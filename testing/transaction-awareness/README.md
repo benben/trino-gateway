@@ -1,9 +1,11 @@
 # Transaction-awareness integration tests
 
 See [OPERATIONS.md](OPERATIONS.md) for supported modes, configuration, cutover
-steps and failure boundaries. See [BASELINE.md](BASELINE.md) for upstream red
-evidence and [client/README.md](client/README.md) for the native JDBC fixture.
-The executed acceptance results are in [VALIDATION.md](VALIDATION.md).
+steps and failure boundaries. See [BASELINE.md](BASELINE.md) for the baseline
+comparison procedure and [client/README.md](client/README.md) for the native JDBC
+fixture. [VALIDATION.md](VALIDATION.md) defines the verification checklist.
+Keep all execution results and deployment outcomes private, including sanitized
+summaries; publish only generic procedures, fixtures, and tests.
 
 This directory contains a Python standard-library black-box test suite and a protocol-focused Trino test double. Python 3.9 or newer is sufficient. The suite deliberately separates baseline controls from the new transaction-awareness contract. Contract failures against upstream are regression evidence, not a successful implementation.
 
@@ -38,7 +40,7 @@ python3 fake_trino.py --host 0.0.0.0 --port 8080 --identity blue
 python3 fake_trino.py --host 0.0.0.0 --port 8081 --identity green
 ```
 
-The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages, `HEAD` heartbeats and query cancellation. It accepts a trailing slash on statement POSTs, as verified against real Trino. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
+The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages, `HEAD` heartbeats and query cancellation. It accepts a trailing slash on statement POSTs. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
 
 Direct fixture controls are `GET /__test/state`, `POST /__test/reset`, `POST /__test/config`, `POST /__test/restart` and `POST /__test/release`. Each simulated process has a distinct `nodeId` and `coordinatorId`; query IDs use that coordinator suffix. Restart changes both identities and clears backend-local transactions and query results. It does not simulate process recovery or migrate a transaction.
 
