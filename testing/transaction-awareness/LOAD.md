@@ -168,6 +168,12 @@ cutover/race tests. The timed throughput window measures steady-state routing.
 
 ## Matrix and safety
 
+An explicit concurrent-cutover case can switch the routing group while timed
+traffic continues. See [the concurrent case contract](MATRIX.md#cutover-during-timed-load).
+This is separate from the default checkpoint sequence, which changes routing
+after measurement. Neither fixture workload establishes distributed query or
+large-result performance against a real Trino cluster.
+
 Compare identical database/client/payload/resources between baseline and fixed
 images. Record image digest, engine/version, actual database capacity, replicas,
 fixture/client resources, and errors. Run ten-second warmups and sixty-second

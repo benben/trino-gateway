@@ -56,6 +56,47 @@ also requires independently collected, current before/after ledger evidence,
 unchanged pod/fixture identities, and adequate client/database metric coverage.
 Do not turn a successful Job into a capacity claim without these external gates.
 
+## Cutover during timed load
+
+The optional `cutover_during_load: {offset_seconds: 30}` profile uses twenty
+Gateways, one routing group, a ten-second warmup, and sixty seconds of aggregate
+1,000-HTTP-RPS traffic. It requires eight client processes and 512 aggregate
+client slots. The caller binds both fixture pod URLs and process fingerprints
+to a fresh, independently verified inventory. Both backends are already running;
+this measures routing cutover, not backend startup or deployment orchestration.
+
+After warmup, the controller opens a source transaction and retains a separate
+source result continuation. During measurement it switches routing to the target
+before draining the source. Draining first would reject new work while the route
+still names the draining backend. After a verified cutover acknowledgement, the
+controller checks the old transaction and a new query through every Gateway,
+then consumes the retained continuation through another Gateway. All proofs must
+finish with at least ten seconds of background traffic remaining.
+
+The load client checks each continuation against its initial query identifier
+and verified coordinator owner. Initial POST responses completed before cutover
+must belong to the source. POSTs dispatched after acknowledgement must belong to
+the target. Requests overlapping the cutover operation may use either owner;
+that allowance never permits a continuation to change owner.
+
+Receipts retain actual cutover request/acknowledgement times, endpoint proof
+intervals, and separate control HTTP counts. Request-start cohorts report exact
+pooled latency percentiles and errors before, during, and after the operation.
+They retain late-start and late-completion counts. An empty cohort has null
+percentiles, not zero latency. Raw identifiers remain in memory, and raw numeric
+samples are discarded before receipt output. Later auditors cannot reconstruct
+the percentiles from compact receipts alone.
+
+The control thread has a bounded deadline and short, remaining-budget-capped
+HTTP calls. Unknown acknowledgements, failed proofs or an active control thread
+prevent restoration. Normal transaction rollback, final drain/seal, resume and
+route restoration happen only after the completed background phase and verified
+control outcome. All original client, throughput and external preservation gates
+remain required. A successful routing proof does not repair a failed load gate.
+
+This mode adds `load_cutover.py` and `load_cutover_aggregate.py` to the six-source
+multi-process bundle. It creates no additional Gateway replicas or backends.
+
 ## Aggregate ledger evidence
 
 `matrix_guard.compare` accepts already-authorized server-side aggregate
