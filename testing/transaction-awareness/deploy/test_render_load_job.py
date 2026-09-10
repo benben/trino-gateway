@@ -42,6 +42,15 @@ class LoadJobTests(unittest.TestCase):
             with self.subTest(priority=priority), self.assertRaises(ValueError):
                 self.render(priority_class=priority)
 
+    def test_explicit_measurement_window_adds_only_bounded_wait(self):
+        start = "2030-01-01T00:05:00Z"
+        job = self.render(measurement_start_utc=start)["items"][1]["spec"]
+        self.assertEqual(job["activeDeadlineSeconds"], 850)
+        self.assertEqual(job["template"]["spec"]["containers"][0]["args"][-2:], ["--measurement-start-utc", start])
+        for invalid in ("tomorrow", "2030-01-01T00:05:00", "2030-13-01T00:05:00Z", 12):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.render(measurement_start_utc=invalid)
+
 
 if __name__ == "__main__":
     unittest.main()

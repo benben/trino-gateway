@@ -2,13 +2,18 @@
 
 import json
 import re
+from datetime import datetime
 
 from render import TASK, validate_priority_class
 
 
 def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *, rate=100,
-               duration=60, warmup=10, expected_backends=None, concurrency=128, priority_class=None):
+               duration=60, warmup=10, expected_backends=None, concurrency=128, priority_class=None, measurement_start_utc=None):
     priority_name = validate_priority_class(priority_class)
+    if measurement_start_utc is not None:
+        if not isinstance(measurement_start_utc, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", measurement_start_utc):
+            raise ValueError("Measurement start must use an explicit ISO 8601 UTC timestamp")
+        datetime.fromisoformat(measurement_start_utc[:-1] + "+00:00")
     if not re.fullmatch(r"gateway-tx-lab-[a-z0-9-]+", namespace) or not re.fullmatch(r"load-[a-z0-9-]+", name):
         raise ValueError("Use an explicit disposable namespace and unique load-* job")
     if not 1 <= rate <= 1000 or not 1 <= duration <= 300 or not 0 <= warmup <= 60 or not 1 <= concurrency <= 512:
@@ -27,7 +32,7 @@ def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *,
               "os.environ['TX_QUERY_AUTHORIZATION']='Basic '+base64.b64encode(('user:'+secrets.token_hex(24)).encode()).decode(); "
               "runpy.run_path('/source/load_open_loop.py',run_name='__main__')")
     job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "namespace": namespace, "labels": labels},
-           "spec": {"backoffLimit": 0, "activeDeadlineSeconds": duration + warmup + 180, "ttlSecondsAfterFinished": 3600,
+           "spec": {"backoffLimit": 0, "activeDeadlineSeconds": duration + warmup + 180 + (600 if measurement_start_utc else 0), "ttlSecondsAfterFinished": 3600,
                     "template": {"metadata": {"labels": labels}, "spec": {
                         "restartPolicy": "Never", "automountServiceAccountToken": False, "preemptionPolicy": "Never", "priorityClassName": priority_name,
                         "securityContext": {"runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
@@ -40,4 +45,6 @@ def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *,
                                         "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}},
                                         "volumeMounts": [{"name": "source", "mountPath": "/source", "readOnly": True}],
                                         "env": [{"name": key, "value": value} for key, value in environment.items()]}]}}}}
+    if measurement_start_utc:
+        job["spec"]["template"]["spec"]["containers"][0]["args"].extend(["--measurement-start-utc", measurement_start_utc])
     return {"apiVersion": "v1", "kind": "List", "items": [config, job]}
