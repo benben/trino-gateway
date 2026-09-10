@@ -4,6 +4,7 @@
 import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import http.client
 import json
 import math
@@ -112,6 +113,16 @@ class OpenLoop:
         self.method_counts = Counter()
         self.latencies, self.corrected_latencies, self.lags = [], [], []
         self.inflight = self.peak_inflight = 0
+        self.second_buckets = [
+            dict(offset_seconds=offset, duration_seconds=min(1, duration - offset),
+                 started=0, completed=0, successful=0, errors=0)
+            for offset in range(math.ceil(duration))
+        ]
+
+    def record_window_event(self, timestamp, event):
+        if self.window_beginning <= timestamp <= self.window_end:
+            offset = min(int(timestamp - self.window_beginning), len(self.second_buckets) - 1)
+            self.second_buckets[offset][event] += 1
 
     def perform(self, sequence, scheduled, end, cleanup=False):
         started = time.monotonic()
@@ -124,6 +135,7 @@ class OpenLoop:
                 self.lags.append((started - scheduled) * 1000)
                 if started <= end:
                     self.counts["started_in_window"] += 1
+                self.record_window_event(started, "started")
         headers = {}
         if continuation:
             path, expected_backend = continuation
@@ -170,6 +182,8 @@ class OpenLoop:
                     self.counts["completed_in_window"] += 1
                     if not error:
                         self.counts["successful_in_window"] += 1
+                self.record_window_event(finished, "completed")
+                self.record_window_event(finished, "errors" if error else "successful")
             if payload and not error:
                 if payload.get("nextUri"):
                     uri = urlsplit(payload["nextUri"])
@@ -183,8 +197,10 @@ class OpenLoop:
     def run(self):
         permit = threading.BoundedSemaphore(self.concurrency)
         beginning = time.monotonic()
+        window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
         cpu_beginning = time.process_time()
         end = beginning + self.duration
+        self.window_beginning, self.window_end = beginning, end
         planned = int(self.rate * self.duration)
 
         def worker(sequence, scheduled):
@@ -224,7 +240,15 @@ class OpenLoop:
         self.transport.close()
         counts = dict(self.counts)
         dropped = counts.get("client_late_drops", 0) + counts.get("client_capacity_drops", 0)
+        request_rates = {}
+        for event in ("started", "completed", "successful", "errors"):
+            rates = [bucket[event] / bucket["duration_seconds"] for bucket in self.second_buckets]
+            request_rates[event] = dict(min=min(rates), max=max(rates),
+                                        avg=sum(bucket[event] for bucket in self.second_buckets) / self.duration)
         return {"scheduled_http_requests": planned, "target_http_rps": self.rate,
+                "window_start_utc": window_start_utc.isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "window_end_utc": (window_start_utc + timedelta(seconds=self.duration)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                "second_buckets": self.second_buckets, "request_rates": request_rates,
                 "window_seconds": self.duration, "completion_elapsed_seconds": measured_elapsed,
                 "offered_http_rps": counts.get("started_in_window", 0) / self.duration,
                 "achieved_http_rps": counts.get("completed_in_window", 0) / self.duration,

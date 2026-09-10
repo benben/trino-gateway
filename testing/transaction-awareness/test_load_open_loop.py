@@ -2,6 +2,7 @@ import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from load_open_loop import OpenLoop, distribution, invalid
 
@@ -25,6 +26,90 @@ class Transport:
 
 
 class OpenLoopTests(unittest.TestCase):
+    def deterministic_load(self, *, duration=2.5, rate=2, delays=None, statuses=None):
+        clock = [100.0]
+        delays = iter(delays or [])
+        statuses = iter(statuses or [])
+
+        class InlineExecutor:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def submit(self, function, *args):
+                function(*args)
+
+        class ScriptedTransport(Transport):
+            def request(self, index, method, path, body, headers):
+                clock[0] += next(delays, .1)
+                status = next(statuses, 200)
+                result = {"nextUri": "http://backend/query/1"} if method == "POST" else {"data": [["blue"]]}
+                return status, json.dumps(result).encode()
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with patch("load_open_loop.ThreadPoolExecutor", InlineExecutor), \
+                patch("load_open_loop.time.monotonic", side_effect=lambda: clock[0]), \
+                patch("load_open_loop.time.sleep", side_effect=advance), \
+                patch("load_open_loop.time.time", return_value=1700000000):
+            return self.run_load(ScriptedTransport(), duration=duration, rate=rate)
+
+    def test_window_telemetry_uses_utc_and_fractional_bucket_rates(self):
+        result = self.deterministic_load(statuses=[200, 503, 200, 200, 200])
+        self.assertIn("window_start_utc", result)
+        self.assertEqual(result["window_start_utc"], "2023-11-14T22:13:20.000000Z")
+        self.assertEqual(result["window_end_utc"], "2023-11-14T22:13:22.500000Z")
+        self.assertEqual(result["second_buckets"], [
+            dict(offset_seconds=0, duration_seconds=1, started=2, completed=2, successful=1, errors=1),
+            dict(offset_seconds=1, duration_seconds=1, started=2, completed=2, successful=2, errors=0),
+            dict(offset_seconds=2, duration_seconds=.5, started=1, completed=1, successful=1, errors=0),
+        ])
+        self.assertEqual(result["request_rates"], {
+            "started": dict(min=2, max=2, avg=2),
+            "completed": dict(min=2, max=2, avg=2),
+            "successful": dict(min=1, max=2, avg=1.6),
+            "errors": dict(min=0, max=1, avg=.4),
+        })
+        self.assertEqual(result["counts"]["started"], 5)
+        self.assertEqual(result["counts"]["cleanup_started"], 1)
+        self.assertEqual(sum(bucket["started"] for bucket in result["second_buckets"]), 5)
+
+    def test_window_telemetry_includes_idle_seconds_but_not_cleanup_errors(self):
+        result = self.deterministic_load(duration=3, rate=1, delays=[2.2, .1], statuses=[200, 503])
+        self.assertIn("second_buckets", result)
+        self.assertEqual(result["second_buckets"], [
+            dict(offset_seconds=0, duration_seconds=1, started=1, completed=0, successful=0, errors=0),
+            dict(offset_seconds=1, duration_seconds=1, started=0, completed=0, successful=0, errors=0),
+            dict(offset_seconds=2, duration_seconds=1, started=0, completed=1, successful=1, errors=0),
+        ])
+        self.assertEqual(result["request_rates"]["started"], dict(min=0, max=1, avg=1 / 3))
+        self.assertEqual(result["request_rates"]["errors"], dict(min=0, max=0, avg=0))
+        self.assertEqual(result["errors"], {"http_503": 1})
+        self.assertTrue(invalid(result))
+
+    def test_window_telemetry_excludes_late_completions(self):
+        result = self.deterministic_load(duration=.5, rate=2, delays=[.75])
+        self.assertIn("second_buckets", result)
+        self.assertEqual(result["second_buckets"], [
+            dict(offset_seconds=0, duration_seconds=.5, started=1, completed=0, successful=0, errors=0),
+        ])
+        self.assertEqual(result["request_rates"]["started"], dict(min=2, max=2, avg=2))
+        self.assertEqual(result["request_rates"]["completed"], dict(min=0, max=0, avg=0))
+        self.assertEqual(result["counts"]["completed"], 1)
+        self.assertEqual(result["achieved_http_rps"], 0)
+
+    def test_window_telemetry_retains_inclusive_end_boundary(self):
+        result = self.deterministic_load(duration=.5, rate=2, delays=[.5])
+        self.assertEqual(result["second_buckets"][0]["completed"], 1)
+        self.assertEqual(result["request_rates"]["completed"], dict(min=2, max=2, avg=2))
+        self.assertEqual(result["achieved_http_rps"], 2)
+
     def run_load(self, transport, **overrides):
         options = dict(rate=100, duration=.2, concurrency=8)
         options.update(overrides)

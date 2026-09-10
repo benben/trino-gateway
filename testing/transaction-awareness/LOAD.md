@@ -29,6 +29,22 @@ p50/p95/p99, errors, scheduling lag, dropped arrivals, CPU time, and outstanding
 continuations. `503` responses are not successful target throughput. Client or
 fixture saturation invalidates a server-capacity conclusion.
 
+`window_start_utc` and `window_end_utc` identify the scheduled measurement
+window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
+schedule; subsequent wall-clock adjustments do not change its end timestamp.
+Warmup has a separate nested receipt. Cleanup traffic and requests completed
+after the window do not enter its `second_buckets` or `request_rates`.
+Existing overall error counts still include cleanup failures and invalidate
+the run when appropriate.
+
+Each second bucket records its offset, duration, and HTTP starts, completions,
+successful completions, and failed completions. Empty buckets contain zeros.
+The final bucket can be shorter than one second. Rate minima and maxima use
+each bucket's actual duration; average rates divide total counts by the full
+window duration. These rates count POSTs and continuation GETs together, not
+SQL queries. Existing per-Gateway method counters retain their separate POST
+and GET totals, including separately named cleanup counters.
+
 ```sh
 export TX_ALLOW_FIXTURE_MUTATION=yes
 export TX_GATEWAY_URLS='<independent-gateway-https-endpoints>'
