@@ -2,6 +2,8 @@
 
 This is a public repository. Do not commit internal infrastructure details, private hostnames, cloud account identifiers, credentials, tokens, customer information, or diagnostic output containing those values. Use generic examples and runtime configuration. Keep local environment settings and raw test output outside the repository.
 
+Do not publish deployment results, load-test or benchmark results, or internal analytics, including sanitized summaries, in this repository or its public PRs and comments. Keep that evidence in private artifacts and share it directly with the user. Publish only generic implementation code, fixtures, tests, and documentation for this work.
+
 ## Transaction-awareness development
 
 - Preserve the standard Trino client protocol and existing behavior when the feature is disabled.

@@ -86,10 +86,24 @@ Size the writer's connection capacity for that fleet and leave operational headr
 Admissions can hold at most three of each four pooled connections, leaving space
 for completion work; other background database work can also use that space.
 Configure deadlines through these fields, not JDBC URL overrides. TLS settings
-remain in the JDBC URL. A bounded pool protects connection count, but does not
-remove contention on a hot backend's existing exclusive row lock.
+remain in the JDBC URL. A bounded pool protects connection count; it does not
+establish a throughput guarantee or remove all database contention.
 Statement and lock timeouts constrain Gateway metadata SQL, not the duration of
 Trino queries or transactions.
+
+Normal admissions and response processing use shared backend row locks. New
+independent admissions also take a shared routing-group lock. Administrative
+operations use exclusive locks on the affected route or backend, so cutover,
+drain and seal remain ordered against admitted work. These are database-transaction
+locks, not a global request queue or locks held for an entire Trino query.
+
+Where applicable, acquire locks in this order: routing group, backend, admission
+row, query identity, then transaction identity. Admission updates serialize on
+their own rows. Query and transaction identities use transaction-scoped advisory
+locks with separate, fixed namespaces and stable identity hashes. Hash collisions
+can serialize unrelated identities within a namespace; they do not replace exact
+identity and ownership checks. Keep this order and namespace mapping compatible
+across Gateway replicas.
 
 The V8 migration adds partial indexes for pending admissions, running queries and
 retained terminal queries. It does not delete history or expire uncertain work.
