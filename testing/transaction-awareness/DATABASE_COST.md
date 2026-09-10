@@ -17,6 +17,10 @@ Run the [connection observer](deploy/OBSERVE_DATABASE.md) across each idle and
 load window. It uses one persistent read-only database connection and reports
 sampled connection minima, maxima, averages, states, and wait types. Its own
 connection is excluded from client counts; its counter overhead still exists.
+The `sessions` counter also records connection creation, including short-lived
+connections that can escape one-second concurrency samples. Counter publication
+can lag; include idle and tail observations and do not equate sessions with SQL
+transactions or HTTP requests.
 
 `database_metrics.py capture` reads the single Serverless writer's CloudWatch
 metrics. It records configured minimum/maximum ACUs separately from observed

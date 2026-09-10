@@ -21,7 +21,7 @@ class ObserverTests(unittest.TestCase):
         return {"sample_time": f"2026-01-01T00:00:{second:02d}.000000Z", "observer_pid": 123,
                 "client_connections": count, "states": {"idle": count}, "wait_types": {"Client": count},
                 "database": {"xact_commit": second + 10, "xact_rollback": 0, "blks_read": 0,
-                             "blks_hit": second + 20, "temp_bytes": 0, "deadlocks": 0, "stats_reset": None}}
+                             "blks_hit": second + 20, "temp_bytes": 0, "deadlocks": 0, "sessions": second + 1, "stats_reset": None}}
 
     def test_job_is_bounded_read_only_and_non_preempting(self):
         objects = self.render(samples=4)["items"]
@@ -60,6 +60,12 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(result["database_delta"]["xact_commit"], 2)
         self.assertTrue(result["valid"])
         self.assertEqual(result["samples"], 3)
+
+    def test_connection_churn_is_distinct_from_simultaneous_connections(self):
+        result = summarize([self.sample(0, 0), self.sample(1, 0), self.sample(2, 0)], expected_samples=3)
+        self.assertEqual(result["client_connections"], {"min": 0, "max": 0, "avg": 0})
+        self.assertEqual(result["database_delta"].get("sessions"), 2)
+        self.assertIn("'sessions', sessions", self.render()["items"][0]["data"]["observe.sql"])
 
     def test_missing_samples_or_reconnect_are_not_silently_accepted(self):
         samples = [self.sample(0), self.sample(1)]

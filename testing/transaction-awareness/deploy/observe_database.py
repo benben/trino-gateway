@@ -20,7 +20,7 @@ SQL = """SELECT json_build_object(
                  FROM (SELECT coalesce(wait_event_type, 'none') AS label, count(*) AS n FROM clients GROUP BY 1) counts),
   'database', (SELECT json_build_object('xact_commit', xact_commit, 'xact_rollback', xact_rollback,
       'blks_read', blks_read, 'blks_hit', blks_hit, 'temp_bytes', temp_bytes,
-      'deadlocks', deadlocks, 'stats_reset', stats_reset)
+      'deadlocks', deadlocks, 'sessions', sessions, 'stats_reset', stats_reset)
     FROM pg_stat_database WHERE datname = current_database()))
 """
 QUERY = """WITH clients AS MATERIALIZED (
@@ -29,7 +29,7 @@ QUERY = """WITH clients AS MATERIALIZED (
     AND application_name <> 'gateway-metrics-observer' AND pid <> pg_backend_pid()
 )
 """ + SQL
-COUNTERS = ("xact_commit", "xact_rollback", "blks_read", "blks_hit", "temp_bytes", "deadlocks")
+COUNTERS = ("xact_commit", "xact_rollback", "blks_read", "blks_hit", "temp_bytes", "deadlocks", "sessions")
 
 
 def render_job(namespace, name, database_secret, ca_configmap, *, samples=300, priority_class=None):
