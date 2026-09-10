@@ -42,7 +42,11 @@ def validate_priority_class(priority_class):
     return name
 
 
-def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=(), gateway_image="trinodb/trino-gateway:21", benchmark=False, priority_class=None):
+def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=(), gateway_image="trinodb/trino-gateway:21", benchmark=False, priority_class=None, benchmark_fixture_memory="512Mi"):
+    if benchmark_fixture_memory not in ("512Mi", "2Gi", "4Gi", "8Gi"):
+        raise ValueError("Benchmark fixture memory must be 512Mi, 2Gi, 4Gi, or 8Gi")
+    if not benchmark and benchmark_fixture_memory != "512Mi":
+        raise ValueError("Fixture memory overrides require benchmark mode")
     priority_name = validate_priority_class(priority_class) if benchmark or priority_class is not None else None
     validate_extra_fixtures(extra_fixtures)
     if extra_fixtures and not fake_source:
@@ -146,7 +150,7 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
         for color in ["blue", "green", *extra_fixtures]:
             cpu, memory = ("100m", "128Mi") if color in {"blue", "green"} else ("50m", "64Mi")
             if benchmark:
-                cpu, memory = "1", "512Mi"
+                cpu, memory = "1", benchmark_fixture_memory
             deployment("fixture-" + color, "python:3.12-alpine", cpu, memory,
                        [{"name": "source", "configMap": {"name": "fake-backend-source"}}],
                        [{"name": "source", "mountPath": "/fixture", "readOnly": True}],
@@ -183,6 +187,22 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
             if item["kind"] == "Deployment":
                 item["spec"]["template"]["spec"]["preemptionPolicy"] = "Never"
                 item["spec"]["template"]["spec"]["priorityClassName"] = priority_name
+    if benchmark and benchmark_fixture_memory != "512Mi":
+        memory_mi = 0
+        for item in objects:
+            if item["kind"] != "Deployment":
+                continue
+            for container in item["spec"]["template"]["spec"]["containers"]:
+                value = container["resources"]["requests"]["memory"]
+                match = re.fullmatch(r"(\d+)(Mi|Gi)", value)
+                if not match:
+                    raise ValueError("Lab memory requests must use integral Mi or Gi")
+                memory_mi += int(match[1]) * (1024 if match[2] == "Gi" else 1) * item["spec"]["replicas"]
+        memory_gi = max(16, (memory_mi + 1024 + 1023) // 1024)
+        if memory_gi > 140:
+            raise ValueError("Benchmark memory plus one GiB headroom exceeds the 140Gi lab limit")
+        quota = next(item for item in objects if item["kind"] == "ResourceQuota")["spec"]["hard"]
+        quota.update({"requests.memory": str(memory_gi) + "Gi", "limits.memory": str(memory_gi) + "Gi"})
     return {"apiVersion": "v1", "kind": "List", "items": objects}
 
 

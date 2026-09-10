@@ -55,7 +55,9 @@ def main():
     create.add_argument("--without-real-trino", action="store_true", help="Create only controlled backends for isolated fault tests")
     create.add_argument("--extra-fixture", action="append", default=[])
     create.add_argument("--gateway-image", default="trinodb/trino-gateway:21", help="Gateway image; use a verified digest for reproducible comparisons")
-    create.add_argument("--benchmark", action="store_true", help="Give controlled backends 1 CPU/512Mi and prohibit pod preemption")
+    create.add_argument("--benchmark", action="store_true", help="Give controlled backends 1 CPU and prohibit pod preemption")
+    create.add_argument("--benchmark-fixture-memory", choices=("512Mi", "2Gi", "4Gi", "8Gi"), default="512Mi",
+                        help="Memory per controlled backend; larger values require benchmark mode and reviewed node capacity")
     create.add_argument("--priority-class", help="Existing task-owned, negative-priority, non-default, non-preempting class; required for benchmark")
     commands.add_parser("status")
     forward = commands.add_parser("forward", help="Keep loopback forwards running; stop with Ctrl-C")
@@ -123,7 +125,8 @@ def main():
         with os.fdopen(descriptor, "w") as output:
             output.write("TX_TRINO_USER=user\nTX_TRINO_PASSWORD=" + shlex.quote(trino_password) + "\n")
         resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed,
-                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture, gateway_image=args.gateway_image, benchmark=args.benchmark, priority_class=priority_class)
+                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture, gateway_image=args.gateway_image,
+                           benchmark=args.benchmark, priority_class=priority_class, benchmark_fixture_memory=args.benchmark_fixture_memory)
         for name, data in [("namespace.json", resources["items"][0]), ("resources.json", resources)]:
             target = runtime / name
             with target.open("x") as output:

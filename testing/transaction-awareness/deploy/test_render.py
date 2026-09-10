@@ -60,6 +60,10 @@ class LabRenderTests(unittest.TestCase):
         priority = {"metadata": {"name": "test-low", "labels": {"task": TASK}}, "value": -10,
                     "preemptionPolicy": "Never", "globalDefault": False}
         items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=priority)["items"]
+        quota = next(item for item in items if item["kind"] == "ResourceQuota")["spec"]["hard"]
+        self.assertEqual((quota["requests.memory"], quota["limits.memory"]), ("16Gi", "16Gi"))
+        self.assertEqual(items, render(self.namespace, "synthetic-test-password", "fake", benchmark=True,
+                                      priority_class=priority, benchmark_fixture_memory="512Mi")["items"])
         for item in items:
             if item["kind"] == "Deployment":
                 pod = item["spec"]["template"]["spec"]
@@ -75,6 +79,45 @@ class LabRenderTests(unittest.TestCase):
                       safe | {"preemptionPolicy": "PreemptLowerPriority"}, safe | {"metadata": {"name": "other-app"}}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=value)
+
+    def test_benchmark_fixture_memory_is_explicit_and_bounded(self):
+        priority = {"metadata": {"name": "fixture-benchmark", "labels": {"task": TASK}},
+                    "value": -10, "preemptionPolicy": "Never", "globalDefault": False}
+        for memory in ("512Mi", "2Gi", "4Gi", "8Gi"):
+            with self.subTest(memory=memory):
+                items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True,
+                               priority_class=priority, benchmark_fixture_memory=memory)["items"]
+                fixtures = [item for item in items if item["kind"] == "Deployment" and item["metadata"]["name"].startswith("fixture-")]
+                self.assertEqual(len(fixtures), 2)
+                for fixture in fixtures:
+                    resources = fixture["spec"]["template"]["spec"]["containers"][0]["resources"]
+                    self.assertEqual(resources, {kind: {"cpu": "1", "memory": memory} for kind in ("requests", "limits")})
+        for memory in ("1Gi", "16Gi", "unbounded", None):
+            with self.subTest(memory=memory), self.assertRaises(ValueError):
+                render(self.namespace, "synthetic-test-password", "fake", benchmark=True,
+                       priority_class=priority, benchmark_fixture_memory=memory)
+        with self.assertRaises(ValueError):
+            render(self.namespace, "synthetic-test-password", "fake", benchmark_fixture_memory="8Gi")
+
+    def test_explicit_benchmark_memory_quota_fits_initial_replicas_and_extra_fixtures(self):
+        priority = {"metadata": {"name": "fixture-benchmark", "labels": {"task": TASK}},
+                    "value": -10, "preemptionPolicy": "Never", "globalDefault": False}
+        for extra in ([], ["cell-two-blue", "cell-two-green"]):
+            items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=priority,
+                           benchmark_fixture_memory="8Gi", extra_fixtures=extra)["items"]
+            quota = next(item for item in items if item["kind"] == "ResourceQuota")["spec"]["hard"]
+            memory_mi = 0
+            for item in items:
+                if item["kind"] == "Deployment":
+                    for container in item["spec"]["template"]["spec"]["containers"]:
+                        value = container["resources"]["requests"]["memory"]
+                        memory_mi += int(value[:-2]) * (1024 if value.endswith("Gi") else 1) * item["spec"]["replicas"]
+            self.assertEqual(quota["requests.memory"], str((memory_mi + 2047) // 1024) + "Gi")
+            self.assertEqual(quota["limits.memory"], quota["requests.memory"])
+            self.assertEqual((quota["requests.cpu"], quota["limits.cpu"], quota["pods"]), ("8", "8", "20"))
+        with self.assertRaisesRegex(ValueError, "140Gi"):
+            render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=priority,
+                   benchmark_fixture_memory="8Gi", extra_fixtures=["cell-" + str(index) for index in range(20)])
 
     def test_benchmark_without_explicit_class_fails_closed(self):
         with self.assertRaises(ValueError):

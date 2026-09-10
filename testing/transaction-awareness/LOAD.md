@@ -107,8 +107,31 @@ The existing PriorityClass must have the task ownership label, a negative priori
 creating this cluster-scoped test resource. The helper never adopts another application's class.
 Pass the verified class object as `priority_class` to `render_job` and database setup.
 Setting the pod's preemption policy alone does not override priority admission.
-Benchmark fixtures request 1 CPU/512 MiB. Review eligible node CPU, memory,
-pod-IP capacity, and quota before external database setup or replica increases.
+Benchmark fixtures default to 1 CPU/512 MiB. For the full matrix, explicitly
+select `--benchmark-fixture-memory 8Gi` for both baseline and fixed images.
+Allowed memory values are `512Mi`, `2Gi`, `4Gi`, and `8Gi`; CPU stays at 1.
+Review eligible node CPU, memory, pod-IP capacity, and quota before external
+database setup or replica increases. The memory override derives initial
+namespace memory quota from rendered requests and replicas, adds 1 GiB
+headroom, and retains a 16 GiB minimum and 140 GiB maximum. It does not widen
+CPU or pod-count quotas, or prove that eligible nodes can fit these requests.
+
+The fixture intentionally retains query results and request history. A local
+synthetic replay through its actual HTTP parser and handlers retained 150,000
+queries and 300,000 HTTP requests, without sockets or Gateway processes.
+CPython 3.9 and 3.13 measured approximately 434–522 MiB of retained Python
+objects, 505–599 MiB process peak RSS before history export, and 591–730 MiB
+including export. These are local allocator/platform observations, not exact
+container predictions. A 512 MiB fixture cannot safely represent the hot
+five-minute 1,000 HTTP-request/second case. The number of Gateway replicas
+does not multiply these request counts, but live connections add overhead.
+
+The 8 GiB allocation provides estimated headroom for the bounded matrix,
+warmups, and history serialization. Use identical resources for both images.
+Monitor actual memory and account for accumulated queries before adding reruns;
+do not silently discard history, evict query results, or reset an uncertain
+fixture to make a failed run pass. Query IDs use a locked per-incarnation
+sequence instead of a bounded random identifier space.
 
 ```sh
 python3 testing/transaction-awareness/deploy/lab.py \
