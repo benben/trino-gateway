@@ -23,6 +23,7 @@ import com.google.inject.Singleton;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
+import io.airlift.units.Duration;
 import io.trino.gateway.ha.clustermonitor.ForMonitor;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
@@ -40,6 +41,7 @@ import io.trino.gateway.ha.transaction.TransactionStore.QueryBinding;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
 import io.trino.gateway.ha.transaction.TransactionStore.StoreException;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
+import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.ws.rs.WebApplicationException;
@@ -57,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -64,14 +67,17 @@ import static io.airlift.http.client.Request.Builder.prepareGet;
 import static io.airlift.http.client.StringResponseHandler.createStringResponseHandler;
 import static io.trino.gateway.ha.handler.ProxyUtils.buildUriWithNewCluster;
 import static io.trino.gateway.ha.handler.ProxyUtils.extractQueryIdIfPresent;
+import static io.trino.gateway.ha.persistence.DatabaseDeadline.withDeadline;
 import static io.trino.gateway.ha.transaction.TransactionIdentity.canonicalTransactionId;
 import static io.trino.gateway.ha.transaction.TransactionIdentity.error;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 @Singleton
 public class TransactionAwarenessService
 {
     private static final String ADMISSION_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".admission";
+    private static final String CAPACITY_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".capacity";
     private static final ObjectMapper JSON = new ObjectMapper(JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private final TransactionAwarenessConfiguration config;
@@ -82,6 +88,7 @@ public class TransactionAwarenessService
     private final List<String> statementPaths;
     private final RoutingGroupSelector routingGroupSelector;
     private final String defaultRoutingGroup;
+    private final TransactionRequestCapacity capacity;
 
     @Inject
     public TransactionAwarenessService(HaGatewayConfiguration configuration, Jdbi jdbi, GatewayBackendManager backendManager, @ForMonitor HttpClient httpClient, RoutingGroupSelector routingGroupSelector)
@@ -95,6 +102,7 @@ public class TransactionAwarenessService
         statementPaths = configuration.getStatementPaths();
         this.routingGroupSelector = routingGroupSelector;
         defaultRoutingGroup = configuration.getRouting().getDefaultRoutingGroup();
+        capacity = config.isEnabled() ? new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout()) : null;
     }
 
     public boolean isEnabled()
@@ -121,63 +129,129 @@ public class TransactionAwarenessService
         if (!isEnabled() || (!submission && !continuation)) {
             return ordinaryRouting.get();
         }
-        return guarded(() -> {
-            Optional<String> transaction = TransactionIdentity.transactionId(request);
-            Admission admission;
-            HttpServletRequest forwardedRequest = request;
-            if (submission) {
-                String owner = identity.owner(request);
-                if (transaction.isPresent()) {
-                    admission = store.admitTransaction(transaction.orElseThrow(), owner);
-                }
-                else {
-                    RoutingSelectorResponse selection = routingGroupSelector.findRoutingDestination(request);
-                    if (!selection.externalHeaders().isEmpty()) {
-                        throw error(400, "Transaction-aware routing does not support external request-header rewrites");
-                    }
-                    String group = selection.routingGroup() == null || selection.routingGroup().isEmpty() ? defaultRoutingGroup : selection.routingGroup();
-                    Optional<String> override = store.getRoute(group);
-                    if (override.isPresent()) {
-                        admission = store.admitNew(override.orElseThrow(), owner, group);
-                        forwardedRequest = RoutingTargetHandler.withRoutingHeaders(request, selection.externalHeaders());
+        TransactionRequestCapacity.Lease lease = capacity.acquire();
+        request.setAttribute(CAPACITY_ATTRIBUTE, lease);
+        try {
+            return guarded(() -> withDeadline(lease.deadlineNanos(), true, () -> {
+                lease.remaining();
+                Optional<String> transaction = TransactionIdentity.transactionId(request);
+                Admission admission;
+                HttpServletRequest forwardedRequest = request;
+                if (submission) {
+                    String owner = identity.owner(request);
+                    if (transaction.isPresent()) {
+                        admission = store.admitTransaction(transaction.orElseThrow(), owner);
                     }
                     else {
-                        RoutingTargetResponse selected = selectBackend.apply(selection);
-                        ProxyBackendConfiguration candidate = backendManager.getAllBackends().stream()
-                                .filter(backend -> backend.getProxyTo().equals(selected.routingDestination().clusterHost()))
-                                .filter(backend -> backend.getRoutingGroup().equals(group))
-                                .findFirst().orElseThrow(() -> error(503, "No backend belongs to the selected routing group"));
-                        if (store.getBackend(candidate.getName()).isEmpty()) {
-                            ensureBackend(candidate.getName());
+                        RoutingSelectorResponse selection = routingGroupSelector.findRoutingDestination(request);
+                        if (!selection.externalHeaders().isEmpty()) {
+                            throw error(400, "Transaction-aware routing does not support external request-header rewrites");
                         }
-                        admission = store.admitNew(candidate.getName(), owner, group);
-                        forwardedRequest = selected.modifiedRequest();
+                        String group = selection.routingGroup() == null || selection.routingGroup().isEmpty() ? defaultRoutingGroup : selection.routingGroup();
+                        Optional<String> override = store.getRoute(group);
+                        if (override.isPresent()) {
+                            admission = store.admitNew(override.orElseThrow(), owner, group);
+                            forwardedRequest = RoutingTargetHandler.withRoutingHeaders(request, selection.externalHeaders());
+                        }
+                        else {
+                            RoutingTargetResponse selected = selectBackend.apply(selection);
+                            ProxyBackendConfiguration candidate = backendManager.getAllBackends().stream()
+                                    .filter(backend -> backend.getProxyTo().equals(selected.routingDestination().clusterHost()))
+                                    .filter(backend -> backend.getRoutingGroup().equals(group))
+                                    .findFirst().orElseThrow(() -> error(503, "No backend belongs to the selected routing group"));
+                            if (store.getBackend(candidate.getName()).isEmpty()) {
+                                ensureBackend(candidate.getName(), lease.remaining());
+                            }
+                            admission = store.admitNew(candidate.getName(), owner, group);
+                            forwardedRequest = selected.modifiedRequest();
+                        }
                     }
                 }
-            }
-            else {
-                if (request.getRequestURI().startsWith("/v1/query/") && TransactionIdentity.singleHeader(request, "Authorization").isEmpty()) {
-                    throw error(401, "Query metadata and query-ID cancellation require owner credentials");
+                else {
+                    if (request.getRequestURI().startsWith("/v1/query/") && TransactionIdentity.singleHeader(request, "Authorization").isEmpty()) {
+                        throw error(401, "Query metadata and query-ID cancellation require owner credentials");
+                    }
+                    String queryId = extractQueryIdIfPresent(request.getRequestURI(), null, statementPaths)
+                            .orElseThrow(() -> error(400, "Invalid query continuation path"));
+                    QueryBinding query = store.getQuery(queryId).orElseThrow(() -> error(404, "Unknown query identifier"));
+                    identity.validateContinuation(request, query.ownerHash());
+                    Optional<String> capability = request.getRequestURI().startsWith("/v1/query/") ? Optional.empty() : Optional.of(capabilityHash(request.getRequestURI()));
+                    admission = store.admitQuery(queryId, Optional.of(query.ownerHash()), transaction, capability);
                 }
-                String queryId = extractQueryIdIfPresent(request.getRequestURI(), null, statementPaths)
-                        .orElseThrow(() -> error(400, "Invalid query continuation path"));
-                QueryBinding query = store.getQuery(queryId).orElseThrow(() -> error(404, "Unknown query identifier"));
-                identity.validateContinuation(request, query.ownerHash());
-                Optional<String> capability = request.getRequestURI().startsWith("/v1/query/") ? Optional.empty() : Optional.of(capabilityHash(request.getRequestURI()));
-                admission = store.admitQuery(queryId, Optional.of(query.ownerHash()), transaction, capability);
-            }
+                request.setAttribute(ADMISSION_ATTRIBUTE, admission);
+                lease.remaining();
+                verifyProcess(admission.backend(), lease.remaining());
+                lease.remaining();
+                forwardedRequest = inlineResults(forwardedRequest);
+                forwardedRequest.setAttribute(ADMISSION_ATTRIBUTE, admission);
+                BackendRef backend = admission.backend();
+                return new RoutingTargetResponse(new RoutingDestination(backend.routingGroup(), backend.url(), buildUriWithNewCluster(backend.url(), forwardedRequest), backend.externalUrl()), forwardedRequest);
+            }));
+        }
+        catch (RuntimeException failure) {
             try {
-                verifyProcess(admission.backend());
+                requestRejectedBeforeDispatch(request);
             }
-            catch (RuntimeException e) {
-                store.rejectAdmission(admission.id());
-                throw e;
+            catch (RuntimeException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
             }
-            forwardedRequest = inlineResults(forwardedRequest);
-            forwardedRequest.setAttribute(ADMISSION_ATTRIBUTE, admission);
-            BackendRef backend = admission.backend();
-            return new RoutingTargetResponse(new RoutingDestination(backend.routingGroup(), backend.url(), buildUriWithNewCluster(backend.url(), forwardedRequest), backend.externalUrl()), forwardedRequest);
-        });
+            throw failure;
+        }
+    }
+
+    public boolean hasRequestCapacity(HttpServletRequest request)
+    {
+        return request.getAttribute(CAPACITY_ATTRIBUTE) instanceof TransactionRequestCapacity.Lease;
+    }
+
+    public Duration remainingRequestTime(HttpServletRequest request)
+    {
+        return ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).remaining();
+    }
+
+    public Executor completionExecutor()
+    {
+        return capacity.completions();
+    }
+
+    public <T> T completionPhase(Supplier<T> action)
+    {
+        return withDeadline(System.nanoTime() + MILLISECONDS.toNanos(config.getCompletionTimeoutMillis()), false, action);
+    }
+
+    public void beforeDispatch(HttpServletRequest request)
+    {
+        ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).dispatch();
+    }
+
+    public boolean wasDispatched(HttpServletRequest request)
+    {
+        return hasRequestCapacity(request) && ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).isDispatched();
+    }
+
+    public void manageCompletion(HttpServletRequest request)
+    {
+        ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).manageCompletion();
+    }
+
+    public boolean isCompletionManaged(HttpServletRequest request)
+    {
+        return hasRequestCapacity(request) && ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).isCompletionManaged();
+    }
+
+    public void completeRequest(HttpServletRequest request)
+    {
+        if (request.getAttribute(CAPACITY_ATTRIBUTE) instanceof TransactionRequestCapacity.Lease lease) {
+            lease.close();
+        }
+    }
+
+    @PreDestroy
+    public void shutdown()
+    {
+        if (capacity != null) {
+            capacity.shutdown();
+        }
     }
 
     public ProxyResponse recordResponse(HttpServletRequest request, ProxyResponse response)
@@ -285,12 +359,17 @@ public class TransactionAwarenessService
 
     public void requestRejectedBeforeDispatch(HttpServletRequest request)
     {
-        Admission admission = admission(request);
-        if (admission != null) {
-            guarded(() -> {
-                store.rejectAdmission(admission.id());
-                return null;
-            });
+        try {
+            Admission admission = admission(request);
+            if (admission != null) {
+                completionPhase(() -> guarded(() -> {
+                    store.rejectAdmission(admission.id());
+                    return null;
+                }));
+            }
+        }
+        finally {
+            completeRequest(request);
         }
     }
 
@@ -368,14 +447,24 @@ public class TransactionAwarenessService
 
     private BackendRef ensureBackend(String name)
     {
+        return ensureBackend(name, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
+    }
+
+    private BackendRef ensureBackend(String name, Duration remaining)
+    {
         ProxyBackendConfiguration backend = backendManager.getBackendByName(name).orElseThrow(() -> error(404, "Unknown backend"));
-        JsonNode info = processInfo(backend.getProxyTo());
+        JsonNode info = processInfo(backend.getProxyTo(), remaining);
         return store.ensureBackend(name, backend.getProxyTo(), backend.getExternalUrl() == null ? backend.getProxyTo() : backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
     }
 
     private void verifyProcess(BackendRef backend)
     {
-        JsonNode info = processInfo(backend.url());
+        verifyProcess(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
+    }
+
+    private void verifyProcess(BackendRef backend, Duration remaining)
+    {
+        JsonNode info = processInfo(backend.url(), remaining);
         if (!backend.nodeId().equals(info.path("nodeId").asText()) || !backend.coordinatorId().equals(info.path("coordinatorId").asText())) {
             throw error(409, "The original coordinator process is no longer available");
         }
@@ -383,7 +472,14 @@ public class TransactionAwarenessService
 
     private JsonNode processInfo(String backend)
     {
-        StringResponse response = httpClient.execute(prepareGet().setUri(URI.create(backend + "/v1/info")).setFollowRedirects(false).build(), createStringResponseHandler());
+        return processInfo(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
+    }
+
+    private JsonNode processInfo(String backend, Duration remaining)
+    {
+        Duration timeout = new Duration(Math.max(1, Math.min(config.getProcessInfoTimeoutMillis(), remaining.toMillis())), MILLISECONDS);
+        StringResponse response = httpClient.execute(prepareGet().setUri(URI.create(backend + "/v1/info"))
+                .setRequestTimeout(timeout).setIdleTimeout(timeout).setFollowRedirects(false).build(), createStringResponseHandler());
         try {
             JsonNode info = JSON.readTree(response.getBody());
             if (response.getStatusCode() != 200 || info == null || !info.path("coordinator").asBoolean() || info.path("starting").asBoolean(true) || info.path("nodeId").asText().isBlank() || !info.path("coordinatorId").asText().matches("[a-zA-Z0-9]{5}")) {

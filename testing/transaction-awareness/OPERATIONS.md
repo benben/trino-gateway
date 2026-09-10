@@ -13,6 +13,11 @@ transactionAwareness:
   identityKey: <shared-random-key-from-private-runtime-configuration>
   adminToken: <different-shared-random-token-from-private-runtime-configuration>
   terminalRetentionSeconds: 120
+  maxInFlightRequests: 16
+  completionThreads: 4
+  requestTimeoutMillis: 120000
+  processInfoTimeoutMillis: 5000
+  completionTimeoutMillis: 10000
 ```
 
 Each key must contain at least 32 UTF-8 bytes. Generate them outside source
@@ -25,6 +30,74 @@ same endpoint: they can forward requests without creating drain obligations.
 Use the same authoritative PostgreSQL writer for ledger reads and writes, not
 asynchronous read replicas. The protocol assumes committed ledger data is durable.
 Database failover and production-scale performance require separate validation.
+
+### Request capacity and deadlines
+
+Each replica admits at most `maxInFlightRequests` managed proxy requests. Excess
+requests receive HTTP 503 before durable admission or backend dispatch. This is a
+per-process bound, not a fleet-wide throughput guarantee. Completion work uses
+`completionThreads` fixed workers and a bounded queue reserved by those admissions.
+The worker count must be positive and no greater than the request limit. Shutdown
+rejects new admissions but retains the reserved completion workers for admitted work.
+
+The admission budget starts before ledger lookup and is the smaller of
+`requestTimeoutMillis` and `routing.asyncTimeout`. Coordinator identity probes
+have a transport timeout capped by both `processInfoTimeoutMillis` and the remaining
+budget. Backend dispatch also uses the remaining request budget. A deadline that
+expires before dispatch rejects the admission; it does not submit the statement.
+After dispatch, client timeout or cancellation does not cancel outcome processing
+or release its capacity slot. The admission remains a drain blocker until its
+actual outcome is recorded. Failures retain uncertainty; Gateway does not resubmit.
+
+Completion database work receives a fresh `completionTimeoutMillis` budget so it
+can record facts after a client timeout. These are bounded phases, not hard
+real-time cancellation guarantees: JDBC timeout rounding, cancellation delivery,
+connection acquisition and socket timeouts can extend observed latency. Custom
+routing selectors and authentication extensions must also bound their own blocking
+work; the admission deadline is checked again before backend dispatch.
+
+If response persistence fails, uncertainty recording receives a second fresh
+completion budget. Waiting in the bounded completion queue is outside these
+budgets; `completionTimeoutMillis` is not a total completion latency bound.
+
+### Database capacity
+
+Transaction awareness automatically enables a managed PostgreSQL connection pool.
+Feature-disabled deployments retain their previous connection behavior unless
+they explicitly enable `dataStore.connectionPoolEnabled`.
+
+```yaml
+dataStore:
+  maximumPoolSize: 4
+  connectionAcquisitionTimeoutMillis: 1000
+  connectTimeoutSeconds: 2
+  socketTimeoutSeconds: 10
+  statementTimeoutMillis: 5000
+  lockTimeoutMillis: 250
+```
+
+These limits apply per replica. One hundred replicas can open up to 400 pooled
+connections with these defaults, plus startup migration and operational connections.
+Size the writer's connection capacity for that fleet and leave operational headroom.
+Admissions can hold at most three of each four pooled connections, leaving space
+for completion work; other background database work can also use that space.
+Configure deadlines through these fields, not JDBC URL overrides. TLS settings
+remain in the JDBC URL. A bounded pool protects connection count, but does not
+remove contention on a hot backend's existing exclusive row lock.
+
+The V8 migration adds partial indexes for pending admissions, running queries and
+retained terminal queries. It does not delete history or expire uncertain work.
+Apply this migration during a quiesced, controlled upgrade: ordinary index creation
+can block ledger writes on a large existing database. This is not a validated
+zero-downtime schema migration procedure.
+
+### Response memory
+
+Capacity limits do not establish a hard heap bound. With the default 32 MiB
+response limit, 16 admitted responses can retain up to 512 MiB of raw bodies alone.
+Strings, parsed JSON, completion workers and client response buffers require more
+memory. Size the request limit against the configured response limit and measured
+heap usage; small-page load tests do not validate worst-case response memory.
 
 The initial identity mode requires stable HTTP Basic credentials and consistent
 effective/original Trino users. Backend authentication and authorization remain

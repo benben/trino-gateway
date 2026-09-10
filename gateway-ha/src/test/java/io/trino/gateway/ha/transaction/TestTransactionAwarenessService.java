@@ -16,6 +16,7 @@ package io.trino.gateway.ha.transaction;
 import com.google.common.collect.ImmutableListMultimap;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
+import io.airlift.http.client.Request;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
@@ -64,6 +65,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -104,6 +106,7 @@ class TestTransactionAwarenessService
     @AfterEach
     void closeConstruction()
     {
+        service.shutdown();
         construction.close();
     }
 
@@ -576,6 +579,89 @@ class TestTransactionAwarenessService
         when(process.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
         when(httpClient.execute(any(), any())).thenReturn(process);
         return admission;
+    }
+
+    @Test
+    void overloadIsRejectedBeforeDurableAdmissionOrProbe()
+    {
+        configureKnownQuery();
+        for (int index = 0; index < 16; index++) {
+            service.resolve(request("GET", CONTINUATION, Map.of()),
+                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                    _ -> { throw new AssertionError("Unexpected backend selection"); });
+        }
+        expectStatus(503, () -> service.resolve(
+                request("HEAD", CONTINUATION, Map.of()),
+                () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                _ -> { throw new AssertionError("Unexpected backend selection"); }));
+        verify(store, times(16)).admitQuery(anyString(), any(), any(), any());
+        verify(httpClient, times(16)).execute(any(), any());
+    }
+
+    @Test
+    void processProbeHasAnExplicitBoundedRequestTimeout()
+    {
+        configureKnownQuery();
+        service.resolve(request("GET", CONTINUATION, Map.of()),
+                () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                _ -> { throw new AssertionError("Unexpected backend selection"); });
+        org.mockito.ArgumentCaptor<Request> probe = org.mockito.ArgumentCaptor.forClass(Request.class);
+        verify(httpClient).execute(probe.capture(), any());
+        assertThat(probe.getValue().getRequestTimeout()).isPresent();
+        assertThat(probe.getValue().getRequestTimeout().orElseThrow().toMillis()).isBetween(1L, 5000L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    void rejectedAdmissionsReleaseCapacityForEveryContinuationMethod(String method)
+    {
+        configureKnownQuery();
+        for (int index = 0; index < 32; index++) {
+            RoutingTargetResponse result = service.resolve(
+                    request(method, CONTINUATION, Map.of()),
+                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                    _ -> { throw new AssertionError("Unexpected backend selection"); });
+            service.requestRejectedBeforeDispatch(result.modifiedRequest());
+        }
+        verify(store, times(32)).rejectAdmission(any());
+    }
+
+    @Test
+    void failedProcessProbesDoNotLeakAdmissionCapacity()
+    {
+        configureKnownQuery();
+        when(httpClient.execute(any(), any())).thenThrow(new IllegalStateException("synthetic probe failure"));
+        for (int index = 0; index < 32; index++) {
+            expectStatus(503, () -> service.resolve(
+                    request("GET", CONTINUATION, Map.of()),
+                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                    _ -> { throw new AssertionError("Unexpected backend selection"); }));
+        }
+        verify(store, times(32)).admitQuery(anyString(), any(), any(), any());
+        verify(store, times(32)).rejectAdmission(any());
+    }
+
+    @Test
+    void deadlineThatExpiresDuringProbeRejectsKnownAdmissionBeforeDispatch()
+    {
+        service.shutdown();
+        configuration.getRouting().setAsyncTimeout(new io.airlift.units.Duration(50, java.util.concurrent.TimeUnit.MILLISECONDS));
+        service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector);
+        store = construction.constructed().getLast();
+        Admission admission = configureKnownQuery();
+        StringResponse process = mock(StringResponse.class);
+        when(process.getStatusCode()).thenReturn(200);
+        when(process.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
+        when(httpClient.execute(any(), any())).thenAnswer(_ -> {
+            java.util.concurrent.TimeUnit.MILLISECONDS.sleep(100);
+            return process;
+        });
+        expectStatus(504, () -> service.resolve(
+                request("GET", CONTINUATION, Map.of()),
+                () -> { throw new AssertionError("Unexpected ordinary routing"); },
+                _ -> { throw new AssertionError("Unexpected backend selection"); }));
+        verify(store).rejectAdmission(admission.id());
+        verify(store, never()).markUncertain(any());
     }
 
     private static HttpServletRequest admitted(String method, String path, String queryId, String transactionId)

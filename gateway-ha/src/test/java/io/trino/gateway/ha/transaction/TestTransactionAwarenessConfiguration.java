@@ -60,6 +60,46 @@ class TestTransactionAwarenessConfiguration
         }
     }
 
+    @Test
+    void testRequestCapacityAndDeadlinesAreValidated()
+    {
+        TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
+        config.setEnabled(true);
+        config.setIdentityKey("synthetic-identity-key-for-tests-only");
+        config.setAdminToken("synthetic-admin-token-for-tests-only");
+        DataStoreConfiguration database = database("jdbc:postgresql://localhost/test");
+        assertThat(config.getMaxInFlightRequests()).isEqualTo(16);
+        assertThat(config.getCompletionThreads()).isEqualTo(4);
+        assertThat(config.getRequestTimeoutMillis()).isEqualTo(120000);
+        assertThat(config.getProcessInfoTimeoutMillis()).isEqualTo(5000);
+        assertThat(config.getCompletionTimeoutMillis()).isEqualTo(10000);
+        config.validate(database);
+        for (int value : new int[] {0, -1, 10001}) {
+            config.setMaxInFlightRequests(value);
+            assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
+        }
+        config.setMaxInFlightRequests(16);
+        for (int value : new int[] {0, -1, 17}) {
+            config.setCompletionThreads(value);
+            assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
+        }
+        config.setCompletionThreads(4);
+        for (int value : new int[] {0, -1, 3600001}) {
+            config.setRequestTimeoutMillis(value);
+            assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
+        }
+        config.setRequestTimeoutMillis(120000);
+        for (int value : new int[] {0, -1, 120001}) {
+            config.setProcessInfoTimeoutMillis(value);
+            assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
+        }
+        config.setProcessInfoTimeoutMillis(5000);
+        for (int value : new int[] {0, -1, 60001}) {
+            config.setCompletionTimeoutMillis(value);
+            assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
     private static DataStoreConfiguration database(String url)
     {
         DataStoreConfiguration configuration = new DataStoreConfiguration();

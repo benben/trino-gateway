@@ -14,9 +14,16 @@
 package io.trino.gateway.ha.persistence;
 
 import io.trino.gateway.ha.config.DataStoreConfiguration;
+import io.trino.gateway.ha.persistence.dao.QueryHistoryDao;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -24,6 +31,41 @@ import static org.mockito.Mockito.when;
 
 final class TestJdbcConnectionManager
 {
+    @Test
+    void transientDatabaseFailureDoesNotStopFutureCleanupRuns()
+            throws Exception
+    {
+        Jdbi database = Mockito.mock(Jdbi.class);
+        QueryHistoryDao history = Mockito.mock(QueryHistoryDao.class);
+        when(database.onDemand(QueryHistoryDao.class)).thenReturn(history);
+        CountDownLatch recovered = new CountDownLatch(1);
+        Mockito.doThrow(new IllegalStateException("synthetic database timeout"))
+                .doAnswer(_ -> {
+                    recovered.countDown();
+                    return null;
+                }).when(history).deleteOldHistory(Mockito.anyLong());
+        ScheduledExecutorService registeredScheduler = Mockito.mock(ScheduledExecutorService.class);
+        try (var scheduler = Executors.newSingleThreadScheduledExecutor()) {
+            JdbcConnectionManager manager;
+            ArgumentCaptor<Runnable> task = ArgumentCaptor.forClass(Runnable.class);
+            try (var factories = Mockito.mockStatic(Executors.class)) {
+                factories.when(Executors::newSingleThreadScheduledExecutor).thenReturn(registeredScheduler);
+                manager = new JdbcConnectionManager(database, new DataStoreConfiguration());
+                Mockito.verify(registeredScheduler).scheduleWithFixedDelay(task.capture(), Mockito.eq(1L), Mockito.eq(120L), Mockito.eq(TimeUnit.MINUTES));
+            }
+            var scheduled = scheduler.scheduleWithFixedDelay(task.getValue(), 0, 10, TimeUnit.MILLISECONDS);
+            try {
+                boolean cleanupRecovered = recovered.await(2, TimeUnit.SECONDS);
+                Mockito.verify(history, Mockito.atLeastOnce()).deleteOldHistory(Mockito.anyLong());
+                assertThat(cleanupRecovered).isTrue();
+            }
+            finally {
+                scheduled.cancel(false);
+                manager.close();
+            }
+        }
+    }
+
     @Test
     void testBuildJdbcUrlWithH2AndNoRoutingGroupDatabase()
     {

@@ -19,6 +19,7 @@ import io.airlift.log.Logger;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.persistence.dao.QueryHistoryDao;
 import jakarta.annotation.Nullable;
+import jakarta.annotation.PreDestroy;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.sqlobject.SqlObjectPlugin;
 
@@ -106,12 +107,23 @@ public class JdbcConnectionManager
     {
         executorService.scheduleWithFixedDelay(
                 () -> {
-                    log.info("Performing query history cleanup task");
-                    long created = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(this.configuration.getQueryHistoryHoursRetention());
-                    jdbi.onDemand(QueryHistoryDao.class).deleteOldHistory(created);
+                    try {
+                        log.info("Performing query history cleanup task");
+                        long created = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(this.configuration.getQueryHistoryHoursRetention());
+                        jdbi.onDemand(QueryHistoryDao.class).deleteOldHistory(created);
+                    }
+                    catch (RuntimeException e) {
+                        log.warn(e, "Query history cleanup failed; the next scheduled run will retry");
+                    }
                 },
                 1,
                 120,
                 TimeUnit.MINUTES);
+    }
+
+    @PreDestroy
+    public void close()
+    {
+        executorService.shutdownNow();
     }
 }

@@ -42,6 +42,7 @@ import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.OAuth2GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.RoutingRulesConfiguration;
 import io.trino.gateway.ha.config.RulesExternalConfiguration;
+import io.trino.gateway.ha.persistence.GatewayDataSource;
 import io.trino.gateway.ha.persistence.JdbcConnectionManager;
 import io.trino.gateway.ha.persistence.RecordAndAnnotatedConstructorMapper;
 import io.trino.gateway.ha.router.BackendStateManager;
@@ -84,6 +85,7 @@ public class HaGatewayProviderModule
         binder().bind(QueryHistoryManager.class).to(HaQueryHistoryManager.class).in(Scopes.SINGLETON);
         binder().bind(BackendStateManager.class).in(Scopes.SINGLETON);
         binder().bind(JdbcConnectionManager.class).in(Scopes.SINGLETON);
+        binder().bind(GatewayDataSource.class).in(Scopes.SINGLETON);
         binder().bind(AuthorizationManager.class).in(Scopes.SINGLETON);
         binder().bind(PathFilter.class).in(Scopes.SINGLETON);
 
@@ -119,9 +121,20 @@ public class HaGatewayProviderModule
 
     @Singleton
     @Provides
+    public static Jdbi provideJdbi(GatewayDataSource dataSource)
+    {
+        Jdbi jdbi = Jdbi.create(dataSource::openConnection);
+        jdbi.setSqlLogger(dataSource.deadlineLogger());
+        return configureJdbi(jdbi);
+    }
+
     public static Jdbi createJdbi(DataStoreConfiguration config)
     {
-        Jdbi jdbi = Jdbi.create(config.getJdbcUrl(), config.getUser(), config.getPassword());
+        return configureJdbi(Jdbi.create(config.getJdbcUrl(), config.getUser(), config.getPassword()));
+    }
+
+    private static Jdbi configureJdbi(Jdbi jdbi)
+    {
         jdbi.installPlugin(new SqlObjectPlugin());
         jdbi.registerRowMapper(new RecordAndAnnotatedConstructorMapper());
         return jdbi;

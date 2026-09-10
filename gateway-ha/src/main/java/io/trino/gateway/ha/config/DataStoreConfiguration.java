@@ -22,6 +22,13 @@ public class DataStoreConfiguration
     private boolean queryHistoryEnabled = true;
     private Integer queryHistoryHoursRetention = 4;
     private boolean runMigrationsEnabled = true;
+    private boolean connectionPoolEnabled;
+    private int maximumPoolSize = 4;
+    private int connectionAcquisitionTimeoutMillis = 1000;
+    private int connectTimeoutSeconds = 2;
+    private int socketTimeoutSeconds = 10;
+    private int statementTimeoutMillis = 5000;
+    private int lockTimeoutMillis = 250;
 
     public DataStoreConfiguration(String jdbcUrl, String user, String password, String driver, boolean queryHistoryEnabled, Integer queryHistoryHoursRetention, boolean runMigrationsEnabled)
     {
@@ -35,6 +42,76 @@ public class DataStoreConfiguration
     }
 
     public DataStoreConfiguration() {}
+
+    public boolean isConnectionPoolEnabled()
+    {
+        return connectionPoolEnabled;
+    }
+
+    public void setConnectionPoolEnabled(boolean connectionPoolEnabled)
+    {
+        this.connectionPoolEnabled = connectionPoolEnabled;
+    }
+
+    public int getMaximumPoolSize()
+    {
+        return maximumPoolSize;
+    }
+
+    public void setMaximumPoolSize(int maximumPoolSize)
+    {
+        this.maximumPoolSize = maximumPoolSize;
+    }
+
+    public int getConnectionAcquisitionTimeoutMillis()
+    {
+        return connectionAcquisitionTimeoutMillis;
+    }
+
+    public void setConnectionAcquisitionTimeoutMillis(int connectionAcquisitionTimeoutMillis)
+    {
+        this.connectionAcquisitionTimeoutMillis = connectionAcquisitionTimeoutMillis;
+    }
+
+    public int getConnectTimeoutSeconds()
+    {
+        return connectTimeoutSeconds;
+    }
+
+    public void setConnectTimeoutSeconds(int connectTimeoutSeconds)
+    {
+        this.connectTimeoutSeconds = connectTimeoutSeconds;
+    }
+
+    public int getSocketTimeoutSeconds()
+    {
+        return socketTimeoutSeconds;
+    }
+
+    public void setSocketTimeoutSeconds(int socketTimeoutSeconds)
+    {
+        this.socketTimeoutSeconds = socketTimeoutSeconds;
+    }
+
+    public int getStatementTimeoutMillis()
+    {
+        return statementTimeoutMillis;
+    }
+
+    public void setStatementTimeoutMillis(int statementTimeoutMillis)
+    {
+        this.statementTimeoutMillis = statementTimeoutMillis;
+    }
+
+    public int getLockTimeoutMillis()
+    {
+        return lockTimeoutMillis;
+    }
+
+    public void setLockTimeoutMillis(int lockTimeoutMillis)
+    {
+        this.lockTimeoutMillis = lockTimeoutMillis;
+    }
 
     public String getJdbcUrl()
     {

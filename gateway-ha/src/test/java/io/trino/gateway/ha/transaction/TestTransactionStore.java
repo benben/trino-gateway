@@ -13,6 +13,7 @@
  */
 package io.trino.gateway.ha.transaction;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
 import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
 import io.trino.gateway.ha.transaction.TransactionStore.ErrorCode;
@@ -89,7 +90,7 @@ class TestTransactionStore
         admin.useHandle(handle -> handle.execute("CREATE SCHEMA " + schema));
         schemaCreated = true;
         database = Jdbi.create(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema, username, password);
-        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql"}) {
+        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql", "V8__drain_obligation_indexes.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
                 database.useHandle(handle -> handle.createScript(sql).execute());
@@ -788,6 +789,56 @@ class TestTransactionStore
         finally {
             database.useHandle(handle -> handle.execute("ALTER TABLE transaction_query_capability DROP CONSTRAINT test_capability_failure"));
         }
+    }
+
+    @Test
+    void drainStatusReadsOutstandingWorkWithoutScanningCompletedHistory()
+            throws IOException
+    {
+        UUID backend = first.getBackend("blue").orElseThrow().incarnation();
+        database.useHandle(handle -> {
+            handle.createUpdate(
+                    """
+                    INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state, observation)
+                    SELECT md5(n::text)::uuid, :backend, 'owner', 'COMPLETE', 'finished'
+                    FROM generate_series(1, 40000) n
+                    """).bind("backend", backend).execute();
+            handle.createUpdate(
+                    """
+                    INSERT INTO transaction_binding (transaction_id, owner_hash, incarnation, start_query_id, state)
+                    SELECT 'closed-' || n, 'owner', :backend, 'history', 'CLOSED'
+                    FROM generate_series(1, 40000) n
+                    """).bind("backend", backend).execute();
+            handle.createUpdate(
+                    """
+                    INSERT INTO transaction_query (query_id, owner_hash, incarnation, terminal, retain_until)
+                    SELECT 'expired-' || n, 'owner', :backend, TRUE, statement_timestamp() - interval '1 day'
+                    FROM generate_series(1, 40000) n
+                    """).bind("backend", backend).execute();
+            handle.createUpdate(
+                    """
+                    INSERT INTO transaction_binding (transaction_id, owner_hash, incarnation, start_query_id, state)
+                    VALUES ('open', 'owner', :backend, 'running', 'OPEN')
+                    """).bind("backend", backend).execute();
+            handle.createUpdate(
+                    """
+                    INSERT INTO transaction_query (query_id, owner_hash, incarnation, terminal, retain_until)
+                    VALUES ('running', 'owner', :backend, FALSE, NULL),
+                           ('retained', 'owner', :backend, TRUE, statement_timestamp() + interval '1 day')
+                    """).bind("backend", backend).execute();
+            handle.execute("ANALYZE transaction_admission, transaction_binding, transaction_query, transaction_backend");
+        });
+        first.admitNew("blue", "owner", "group");
+        first.markUncertain(first.admitNew("blue", "owner", "group").id());
+        var status = first.drainStatus("blue");
+        assertThat(status.pendingRequests()).isEqualTo(2);
+        assertThat(status.openTransactions()).isEqualTo(1);
+        assertThat(status.activeQueries()).isEqualTo(2);
+        String explain = database.withHandle(handle -> handle.createQuery("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + TransactionStore.DRAIN_STATUS_SQL)
+                .bind("id", backend).mapTo(String.class).one());
+        var plan = new ObjectMapper().readTree(explain).get(0).path("Plan");
+        long blocks = plan.path("Shared Hit Blocks").asLong() + plan.path("Shared Read Blocks").asLong();
+        assertThat(blocks).as("Drain status must not read completed history: %s", explain).isLessThan(64);
     }
 
     private List<String> capabilities(String queryId)

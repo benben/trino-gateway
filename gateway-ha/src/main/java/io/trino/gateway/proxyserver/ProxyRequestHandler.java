@@ -16,7 +16,9 @@ package io.trino.gateway.proxyserver;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.FluentFuture;
+import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.SettableFuture;
 import com.google.inject.Inject;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
@@ -50,8 +52,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.util.concurrent.Futures.addCallback;
+import static com.google.common.util.concurrent.Futures.nonCancellationPropagating;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.http.client.HeaderNames.VIA;
@@ -181,44 +186,145 @@ public class ProxyRequestHandler
             AsyncResponse asyncResponse,
             Request.Builder requestBuilder)
     {
-        URI remoteUri = routingDestination.clusterUri();
-        requestBuilder.setUri(remoteUri);
+        try {
+            URI remoteUri = routingDestination.clusterUri();
+            requestBuilder.setUri(remoteUri);
 
-        setupRequestHeaders(servletRequest, requestBuilder);
+            setupRequestHeaders(servletRequest, requestBuilder);
 
-        ImmutableList.Builder<NewCookie> cookieBuilder = ImmutableList.builder();
-        cookieBuilder.addAll(getOAuth2GatewayCookie(remoteUri, servletRequest));
+            ImmutableList.Builder<NewCookie> cookieBuilder = ImmutableList.builder();
+            cookieBuilder.addAll(getOAuth2GatewayCookie(remoteUri, servletRequest));
 
-        Request request = requestBuilder
-                .setFollowRedirects(false)
-                .build();
+            Request request = requestBuilder
+                    .setFollowRedirects(false)
+                    .build();
 
-        FluentFuture<ProxyResponse> future = executeHttp(request);
-
-        if (transactionAwareness != null && transactionAwareness.isEnabled()) {
-            future = future.transform(response -> transactionAwareness.recordResponse(servletRequest, response), executor)
-                    .catching(Exception.class, exception -> {
-                        transactionAwareness.requestFailed(servletRequest);
-                        if (exception instanceof WebApplicationException webException) {
-                            throw webException;
-                        }
-                        throw new WebApplicationException(Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
-                                .entity("Backend request outcome is uncertain; the request was not reassigned").build());
-                    }, directExecutor());
-        }
-
-        if (statementPaths.stream().anyMatch(request.getUri().getPath()::startsWith) && request.getMethod().equals(HttpMethod.POST)) {
-            Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
-            future = future.transform(response -> recordBackendForQueryId(request, response, username, routingDestination), executor);
-            if (includeClusterInfoInResponse) {
-                cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(remoteUri.getHost()).build());
+            if (transactionAwareness != null && transactionAwareness.hasRequestCapacity(servletRequest)) {
+                performBoundedRequest(routingDestination, servletRequest, asyncResponse, requestBuilder, cookieBuilder);
+                return;
             }
-        }
 
-        setupAsyncResponse(
-                asyncResponse,
-                future.transform(response -> buildResponse(response, cookieBuilder.build()), executor)
-                        .catching(ProxyException.class, e -> handleProxyException(request, e), directExecutor()));
+            FluentFuture<ProxyResponse> future = executeHttp(request);
+
+            if (transactionAwareness != null && transactionAwareness.isEnabled()) {
+                future = future.transform(response -> transactionAwareness.recordResponse(servletRequest, response), executor)
+                        .catching(Exception.class, exception -> {
+                            transactionAwareness.requestFailed(servletRequest);
+                            if (exception instanceof WebApplicationException webException) {
+                                throw webException;
+                            }
+                            throw new WebApplicationException(Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
+                                    .entity("Backend request outcome is uncertain; the request was not reassigned").build());
+                        }, directExecutor());
+            }
+
+            if (statementPaths.stream().anyMatch(request.getUri().getPath()::startsWith) && request.getMethod().equals(HttpMethod.POST)) {
+                Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
+                future = future.transform(response -> recordBackendForQueryId(request, response, username, routingDestination), executor);
+                if (includeClusterInfoInResponse) {
+                    cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(remoteUri.getHost()).build());
+                }
+            }
+
+            setupAsyncResponse(
+                    asyncResponse,
+                    future.transform(response -> buildResponse(response, cookieBuilder.build()), executor)
+                            .catching(ProxyException.class, e -> handleProxyException(request, e), directExecutor()));
+        }
+        catch (RuntimeException failure) {
+            if (transactionAwareness != null && transactionAwareness.hasRequestCapacity(servletRequest) && !transactionAwareness.isCompletionManaged(servletRequest)) {
+                if (transactionAwareness.wasDispatched(servletRequest)) {
+                    try {
+                        transactionAwareness.completionPhase(() -> {
+                            transactionAwareness.requestFailed(servletRequest);
+                            return null;
+                        });
+                    }
+                    finally {
+                        transactionAwareness.completeRequest(servletRequest);
+                    }
+                }
+                else {
+                    transactionAwareness.requestRejectedBeforeDispatch(servletRequest);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void performBoundedRequest(
+            RoutingDestination destination,
+            HttpServletRequest servletRequest,
+            AsyncResponse asyncResponse,
+            Request.Builder requestBuilder,
+            ImmutableList.Builder<NewCookie> cookieBuilder)
+    {
+        Duration remaining = transactionAwareness.remainingRequestTime(servletRequest);
+        Request request = requestBuilder.setRequestTimeout(remaining).setIdleTimeout(remaining).build();
+        transactionAwareness.beforeDispatch(servletRequest);
+        FluentFuture<ProxyResponse> backend = executeHttp(request);
+        SettableFuture<Response> completed = SettableFuture.create();
+        AtomicBoolean completionStarted = new AtomicBoolean();
+        addCallback(backend, new FutureCallback<>()
+        {
+            @Override
+            public void onSuccess(ProxyResponse response)
+            {
+                finish(response, null);
+            }
+
+            @Override
+            public void onFailure(Throwable failure)
+            {
+                finish(null, failure);
+            }
+
+            private void finish(ProxyResponse response, Throwable failure)
+            {
+                if (!completionStarted.compareAndSet(false, true)) {
+                    return;
+                }
+                try {
+                    if (failure != null) {
+                        throw new ProxyException("Backend request outcome is uncertain", failure);
+                    }
+                    Response result = transactionAwareness.completionPhase(() -> {
+                        ProxyResponse recorded = transactionAwareness.recordResponse(servletRequest, response);
+                        if (request.getMethod().equals(HttpMethod.POST)) {
+                            Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
+                            recorded = recordBackendForQueryId(request, recorded, username, destination);
+                            if (includeClusterInfoInResponse) {
+                                cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(request.getUri().getHost()).build());
+                            }
+                        }
+                        return buildResponse(recorded, cookieBuilder.build());
+                    });
+                    completed.set(result);
+                }
+                catch (Throwable outcomeFailure) {
+                    try {
+                        transactionAwareness.completionPhase(() -> {
+                            transactionAwareness.requestFailed(servletRequest);
+                            return null;
+                        });
+                    }
+                    catch (RuntimeException recordingFailure) {
+                        outcomeFailure.addSuppressed(recordingFailure);
+                    }
+                    completed.setException(outcomeFailure instanceof WebApplicationException ? outcomeFailure :
+                            new WebApplicationException(Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
+                                                        .entity("Backend request outcome is uncertain; the request was not reassigned").build()));
+                }
+                finally {
+                    transactionAwareness.completeRequest(servletRequest);
+                }
+            }
+        }, transactionAwareness.completionExecutor());
+        transactionAwareness.manageCompletion(servletRequest);
+        Duration clientTimeout = new Duration(Math.min(asyncTimeout.toMillis(), Math.max(1, remaining.toMillis())), java.util.concurrent.TimeUnit.MILLISECONDS);
+        bindAsyncResponse(asyncResponse, nonCancellationPropagating(completed), directExecutor())
+                .withTimeout(clientTimeout, () -> Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
+                        .entity("Transaction-aware response deadline expired; outcome processing remains bounded and retained").build());
     }
 
     private ImmutableList<NewCookie> getOAuth2GatewayCookie(URI remoteUri, HttpServletRequest servletRequest)

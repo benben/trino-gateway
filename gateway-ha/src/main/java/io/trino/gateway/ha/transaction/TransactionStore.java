@@ -28,6 +28,16 @@ import static java.util.Objects.requireNonNull;
 
 public final class TransactionStore
 {
+    static final String DRAIN_STATUS_SQL =
+            """
+            SELECT b.state, b.generation,
+              (SELECT count(*) FROM transaction_admission a WHERE a.incarnation = b.incarnation AND a.state <> 'COMPLETE') AS pending,
+              (SELECT count(*) FROM transaction_binding t WHERE t.incarnation = b.incarnation AND t.state = 'OPEN') AS transactions,
+              (SELECT count(*) FROM transaction_query q WHERE q.incarnation = b.incarnation AND NOT q.terminal)
+                + (SELECT count(*) FROM transaction_query q WHERE q.incarnation = b.incarnation AND q.terminal AND q.retain_until > statement_timestamp()) AS queries
+            FROM transaction_backend b WHERE b.incarnation = :id
+            """;
+
     private final Jdbi jdbi;
 
     public TransactionStore(Jdbi jdbi)
@@ -446,14 +456,7 @@ public final class TransactionStore
 
     private static DrainStatus status(Handle handle, BackendRef backend)
     {
-        return handle.createQuery(
-                        """
-                        SELECT b.state, b.generation,
-                          (SELECT count(*) FROM transaction_admission a WHERE a.incarnation = b.incarnation AND a.state <> 'COMPLETE') AS pending,
-                          (SELECT count(*) FROM transaction_binding t WHERE t.incarnation = b.incarnation AND t.state = 'OPEN') AS transactions,
-                          (SELECT count(*) FROM transaction_query q WHERE q.incarnation = b.incarnation AND (NOT q.terminal OR q.retain_until > clock_timestamp())) AS queries
-                        FROM transaction_backend b WHERE b.incarnation = :id
-                        """).bind("id", backend.incarnation())
+        return handle.createQuery(DRAIN_STATUS_SQL).bind("id", backend.incarnation())
                 .map((rs, _) -> {
                     String state = rs.getString("state");
                     long pending = rs.getLong("pending");
