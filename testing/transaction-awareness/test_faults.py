@@ -182,11 +182,23 @@ class DatabaseFaultContract(GatewayFixture):
     def await_database(self):
         deadline = time.monotonic() + 30
         while True:
-            response = self.backend_status()
-            if response.status == 200:
-                return response.json()
-            self.assertLess(time.monotonic(), deadline, "Gateway database access did not recover")
-            time.sleep(0.1)
+            states = []
+            for gateway in range(len(self.gateways)):
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, "Gateway database access did not recover")
+                response = None
+                try:
+                    response = self.backend_status(gateway=gateway, timeout=min(2, remaining))
+                except OSError:
+                    pass
+                self.assertLessEqual(time.monotonic(), deadline, "Gateway database access did not recover")
+                if response is not None and response.status == 200:
+                    states.append(response.json())
+            if len(states) == len(self.gateways):
+                return states[0]
+            remaining = deadline - time.monotonic()
+            self.assertGreater(remaining, 0, "Gateway database access did not recover")
+            time.sleep(min(0.1, remaining))
 
     def test_database_outage_before_admission_forwards_nothing(self):
         transaction = self.start()

@@ -42,13 +42,13 @@ class GatewayFixture(unittest.TestCase):
         if os.environ.get("TX_ADMIN_TOKEN"):
             cls.admin_headers = [("Authorization", "Bearer " + os.environ["TX_ADMIN_TOKEN"])]
 
-    def admin(self, path, method="GET", body=None, gateway=0):
+    def admin(self, path, method="GET", body=None, gateway=0, timeout=40):
         headers = self.admin_headers + [("Content-Type", "application/json")]
         return request(self.gateways[gateway] + path, method,
-                       json.dumps(body) if body is not None else None, headers)
+                       json.dumps(body) if body is not None else None, headers, timeout=timeout)
 
-    def backend_status(self, index=0, gateway=0):
-        return self.admin("/gateway/transactions/backends/" + self.names[index] + "/drain", gateway=gateway)
+    def backend_status(self, index=0, gateway=0, timeout=40):
+        return self.admin("/gateway/transactions/backends/" + self.names[index] + "/drain", gateway=gateway, timeout=timeout)
 
     def resume(self, index=0):
         status = self.backend_status(index)
