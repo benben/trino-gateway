@@ -60,6 +60,41 @@ explicitly represented by a null quota value, not a guessed capacity. These
 diagnostics do not alter workload validity gates. An external capacity audit
 must separately require valid cgroup evidence when its conclusions need it.
 
+### Optional multi-process client
+
+The default client uses one process. Explicit eight-process mode divides the
+aggregate arrival schedule and concurrency limit among eight spawned workers.
+Select it with `--processes 8`, or `client_processes: 8` in a matrix case.
+It does not multiply the requested rate or number of client slots. Each process
+owns its connections and continuations. All workers must finish no-traffic
+preparation before the parent selects their common monotonic and UTC window.
+Staggered global arrival ordinals preserve the aggregate schedule, including
+fractional per-process rates. A late worker cannot move its own window.
+
+The parent computes global latency and scheduling-lag percentiles from pooled
+numeric samples, never from averages of worker percentiles. Final receipts omit
+those raw arrays to keep log output bounded; the percentiles cannot be independently
+reconstructed from the compact receipt alone. Worker count, profile, counters,
+window alignment and sample lengths are checked before aggregation. A missing or
+failed worker invalidates the phase; remaining workers do not replace its share.
+
+`peak_client_inflight` is null in this mode. Its separately named bounds use the
+largest worker peak as the lower bound and the sum of worker peaks as the upper
+bound. The upper bound is not an observed simultaneous peak. Process CPU sums
+worker CPU only; it excludes parent overhead. The parent samples the whole
+container's shared cgroup series per phase and never sums duplicated worker measurements.
+All workers finish measured requests and late completions before that final CPU
+sample. Only then can any worker begin continuation cleanup. Existing request,
+lag, drop, warmup and cleanup gates remain unchanged.
+
+The matrix renderer requires both `load_multiprocess.py` and `load_aggregate.py`
+alongside its four ordinary source modules for this mode. Standalone
+`render_job(..., processes=8, process_sources=...)` requires the same two added
+modules. Selecting more processes does not increase container resources. Review
+CPU, memory and orchestration deadlines for the chosen private client profile.
+
+### Window and response accounting
+
 `window_start_utc` and `window_end_utc` identify the scheduled measurement
 window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
 schedule; subsequent wall-clock adjustments do not change its end timestamp.
