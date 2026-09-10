@@ -112,6 +112,34 @@ user capture and response-binding failure. The original admission remains the
 target of completion or uncertainty recording, and the slot releases only after
 that processing finishes.
 
+### Repaired image runtime checkpoint
+
+The replacement image uses source `af8bc75ea292bbc1ad517a3a74a7b6ed1ccfe7cd`:
+`ghcr.io/benben/trino-gateway@sha256:e10742bf46cf069b8930ef9e282dfee1093055bef48059eb9da4cec7f1f70f4d`.
+Anonymous pulls and source labels were verified for both architecture manifests.
+The source passed its full Java-version CI matrix and focused transaction tests.
+
+On that exact image, the complete 20-case fault suite passed. All five real-Trino
+HTTP cases and both native JDBC 483 cases passed, using verified TLS and the
+driver's original protocol URLs. The fault suite's deliberately uncertain state
+is retained; passing it does not make its database a clean normal-test fixture.
+
+The first repaired-image overload attempt timed out while awaiting the rejected
+seventeenth request. A diagnostic repeat received the complete 503 response in
+0.607 seconds, and the unchanged original regression then passed. No assertion
+was relaxed and no further production change was made. The first timeout remains
+unexplained and is not erased by those successful repeats.
+
+Normal, deadline, all-Gateway restart, and Aurora load acceptance are still in
+progress at this checkpoint. No successful 1000-request/second or 100-replica
+capacity claim is established by these results.
+
+The repository now includes [database cost measurements](DATABASE_COST.md),
+one-second connection sampling, and aligned HTTP request windows. Their unit
+tests pass. CI also executes the persistent PostgreSQL observer integration test
+against its PostgreSQL service; it does not merely skip that test. These tool
+checks are separate from a measured Aurora load result.
+
 ## Interpretation limits
 
 Pool and request limits are per process. They bound particular resources, not
