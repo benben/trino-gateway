@@ -236,6 +236,19 @@ class CaseProfileTests(unittest.TestCase):
                                 source_process_sha256="a" * 64, target_process_sha256="b" * 64)
         return case
 
+    def test_concurrent_rates_require_their_exact_aggregate_slot_counts(self):
+        from matrix_case import validate
+        for rate, slots in ((100, 128), (1000, 512)):
+            with self.subTest(rate=rate, slots=slots):
+                case = self.case()
+                case.update(rate=rate, concurrency=slots)
+                validate(case)
+        for rate, slots in ((100, 512), (1000, 128), (100, 64), (1000, 256), (250, 128), (100.0, 128)):
+            with self.subTest(rate=rate, slots=slots), self.assertRaises(ValueError):
+                case = self.case()
+                case.update(rate=rate, concurrency=slots)
+                validate(case)
+
     def test_only_explicit_profile_and_bound_fixture_endpoints_are_accepted(self):
         import copy
         from matrix_case import validate

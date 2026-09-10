@@ -58,8 +58,8 @@ def validate(case):
         raise ValueError("Use one or eight processes with divisible aggregate capacity")
     if "cutover_during_load" in case:
         if (case["cutover_during_load"] != {"offset_seconds": 30} or case["replicas"] != 20 or
-                case["rate"] != 1000 or case["duration"] != 60 or case["warmup"] != 10 or
-                processes != 8 or case.get("concurrency") != 512 or len(groups) != 1):
+                type(case["rate"]) is not int or (case["rate"], case.get("concurrency")) not in ((100, 128), (1000, 512)) or
+                case["duration"] != 60 or case["warmup"] != 10 or processes != 8 or len(groups) != 1):
             raise ValueError("Concurrent cutover requires the explicit bounded twenty-Gateway profile")
         urls = []
         for prefix in ("source", "target"):

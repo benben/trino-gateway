@@ -60,8 +60,11 @@ Do not turn a successful Job into a capacity claim without these external gates.
 
 The optional `cutover_during_load: {offset_seconds: 30}` profile uses twenty
 Gateways, one routing group, a ten-second warmup, and sixty seconds of aggregate
-1,000-HTTP-RPS traffic. It requires eight client processes and 512 aggregate
-client slots. The caller binds both fixture pod URLs and process fingerprints
+traffic. It accepts exactly 100 HTTP RPS with 128 aggregate client slots, or
+1,000 HTTP RPS with 512 slots. Both profiles require eight client processes and
+the same warmup, timing, ownership and validity checks. A lower-rate case does
+not establish higher-rate capacity or change another case's validity.
+The caller binds both fixture pod URLs and process fingerprints
 to a fresh, independently verified inventory. Both backends are already running;
 this measures routing cutover, not backend startup or deployment orchestration.
 
