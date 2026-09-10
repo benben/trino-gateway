@@ -44,6 +44,22 @@ the existing process-CPU interval exclude this setup. Scheduled-start checks
 still reject a boundary missed during preparation. All warmup error and client
 lag gates remain unchanged.
 
+`client_cgroup_cpu` records cgroup-v2 CPU quota and counters before setup, before
+timed traffic, and after executor completion. Its `setup_and_scheduled_wait`
+span includes any wait for the requested UTC start. Its
+`workload_and_late_completion` span includes late requests and excludes
+continuation cleanup. These are read-bounded intervals, not exact timed-window
+CPU measurements. Counter deltas include CPU usage, quota periods, throttled
+periods, and throttled microseconds. The receipt retains timestamps and CPU
+quota alongside the deltas; it does not infer a cause for scheduling delays.
+
+Missing or unreadable cgroup-v2 files produce `available: false`. Malformed
+data, counter resets, changed quotas, or invalid time order produce
+`valid: false` and no derived deltas for that span. Unlimited CPU quota is
+explicitly represented by a null quota value, not a guessed capacity. These
+diagnostics do not alter workload validity gates. An external capacity audit
+must separately require valid cgroup evidence when its conclusions need it.
+
 `window_start_utc` and `window_end_utc` identify the scheduled measurement
 window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
 schedule; subsequent wall-clock adjustments do not change its end timestamp.

@@ -45,7 +45,7 @@ jobs:
           -Dsurefire.failIfNoSpecifiedTests=false
       - name: Protocol and network fault fixture self-tests
         working-directory: testing/transaction-awareness
-        run: python3 -m unittest -v test_fake_trino test_network_fault_proxy test_load_open_loop test_load_executor_setup test_load_error_categories test_load_checkpoints test_database_metrics test_protocol_tls test_matrix_case test_fault_recovery
+        run: python3 -m unittest -v test_fake_trino test_network_fault_proxy test_load_open_loop test_load_executor_setup test_load_client_cpu test_load_error_categories test_load_checkpoints test_database_metrics test_protocol_tls test_matrix_case test_fault_recovery
       - name: Disposable lab tooling tests
         working-directory: testing/transaction-awareness/deploy
         env:

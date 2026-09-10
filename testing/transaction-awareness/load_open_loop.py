@@ -9,7 +9,9 @@ import http.client
 import json
 import math
 import os
+from pathlib import Path
 import queue
+import re
 import ssl
 import threading
 import time
@@ -41,6 +43,72 @@ def invalid(result):
     if result is None:
         return False
     return bool(result["errors"] or result["client_bottleneck_detected"] or result["unconsumed_continuations"])
+
+
+def read_client_cpu():
+    """Read cgroup-v2 counters without substituting unavailable measurements."""
+    row = {"available": True, "valid": False, "reason": None, "cpu_max": None, "counters": None,
+           "read_start_monotonic_seconds": time.monotonic(),
+           "read_start_utc": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")}
+    try:
+        maximum = Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+        raw = Path("/sys/fs/cgroup/cpu.stat").read_text()
+        if not re.fullmatch(r"(max|[1-9][0-9]*) [1-9][0-9]*", maximum):
+            raise ValueError("Malformed CPU quota")
+        quota, period = maximum.split()
+        counters = {}
+        for line in raw.splitlines():
+            match = re.fullmatch(r"([a-z_]+) ([0-9]+)", line)
+            if not match or match[1] in counters:
+                raise ValueError("Malformed CPU counter")
+            counters[match[1]] = int(match[2])
+        if not {"usage_usec", "nr_periods", "nr_throttled", "throttled_usec"} <= counters.keys():
+            raise ValueError("Missing CPU counters")
+        row.update(valid=True, cpu_max=[None if quota == "max" else int(quota), int(period)], counters=counters)
+    except OSError:
+        row.update(available=False, reason="cgroup_v2_unavailable_or_unreadable")
+    except (ValueError, UnicodeError):
+        row["reason"] = "malformed_cgroup_v2_cpu_data"
+    row["read_end_utc"] = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    row["read_end_monotonic_seconds"] = time.monotonic()
+    return row
+
+
+def client_cpu_span(before, after):
+    result = {"available": before["available"] and after["available"], "valid": False, "reason": None,
+              "elapsed_seconds_bounds": None, "counter_deltas": None, "average_cpu_cores_bounds": None}
+    if not result["available"] or not before["valid"] or not after["valid"]:
+        result["reason"] = "snapshot_unavailable_or_invalid"
+        return result
+    times = [row[key] for row in (before, after)
+             for key in ("read_start_monotonic_seconds", "read_end_monotonic_seconds")]
+    if (any(type(value) not in (int, float) or not math.isfinite(value) for value in times) or
+            not times[0] <= times[1] < times[2] <= times[3]):
+        result["reason"] = "invalid_or_nonincreasing_read_times"
+    elif before["cpu_max"] != after["cpu_max"]:
+        result["reason"] = "cpu_quota_changed"
+    elif (before["counters"].keys() != after["counters"].keys() or
+          any(after["counters"][key] < value for key, value in before["counters"].items())):
+        result["reason"] = "cpu_counter_reset_or_shape_changed"
+    else:
+        elapsed = {"min": times[2] - times[1], "max": times[3] - times[0]}
+        deltas = {key: after["counters"][key] - value for key, value in before["counters"].items()}
+        result.update(valid=True, elapsed_seconds_bounds=elapsed, counter_deltas=deltas,
+                      average_cpu_cores_bounds={"min": deltas["usage_usec"] / 1_000_000 / elapsed["max"],
+                                               "max": deltas["usage_usec"] / 1_000_000 / elapsed["min"]})
+    return result
+
+
+def client_cpu_diagnostics(snapshots):
+    if set(snapshots) != {"before_setup", "before_workload", "after_completion"}:
+        raise ValueError("Require all three client CPU snapshots")
+    spans = {"setup_and_scheduled_wait": client_cpu_span(snapshots["before_setup"], snapshots["before_workload"]),
+             "workload_and_late_completion": client_cpu_span(snapshots["before_workload"], snapshots["after_completion"])}
+    return {"available": all(row["available"] for row in snapshots.values()),
+            "valid": all(row["valid"] for row in snapshots.values()) and all(row["valid"] for row in spans.values()),
+            "snapshots": snapshots, "spans": spans,
+            "interpretation": "Cgroup counter deltas cover actual read-bounded spans, not exact timed-window CPU. "
+                              "Setup includes scheduled waiting; workload includes late completion and excludes continuation cleanup."}
 
 
 def prepare_workers(executor, count, timeout=30):
@@ -251,6 +319,7 @@ class OpenLoop:
 
     def run(self):
         permit = threading.BoundedSemaphore(self.concurrency)
+        cpu_snapshots = {"before_setup": read_client_cpu()}
         setup_beginning = time.monotonic()
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
             prepare_workers(executor, self.concurrency)
@@ -263,6 +332,7 @@ class OpenLoop:
                     raise ValueError("Scheduled measurement start was missed by more than one second")
                 if delay > 0:
                     time.sleep(delay)
+            cpu_snapshots["before_workload"] = read_client_cpu()
             beginning = time.monotonic()
             window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
             start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
@@ -298,6 +368,7 @@ class OpenLoop:
                 executor.submit(worker, sequence, scheduled)
         measured_elapsed = time.monotonic() - beginning
         cpu_elapsed = time.process_time() - cpu_beginning
+        cpu_snapshots["after_completion"] = read_client_cpu()
         cleanup_deadline = time.monotonic() + min(120, max(30, self.timeout * 2))
         for sequence in range(planned, planned + self.concurrency * 20):
             if time.monotonic() >= cleanup_deadline:
@@ -317,6 +388,7 @@ class OpenLoop:
         return {"scheduled_http_requests": planned, "target_http_rps": self.rate,
                 "client_setup_seconds": setup_elapsed,
                 "client_setup_method": "all executor workers started before the window; no backend traffic",
+                "client_cgroup_cpu": client_cpu_diagnostics(cpu_snapshots),
                 "window_start_utc": window_start_utc.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "window_end_utc": (window_start_utc + timedelta(seconds=self.duration)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "planned_window_start_utc": None if self.measurement_start is None else self.measurement_start.isoformat(timespec="microseconds").replace("+00:00", "Z"),
