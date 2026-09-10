@@ -6,6 +6,10 @@ import time
 from protocol import finish, request, statement
 
 
+def no_obligations(status):
+    return all(status.get(field) == 0 for field in ("pendingRequests", "openTransactions", "activeQueries"))
+
+
 class Checkpoints:
     def __init__(self, gateways, group, source_name, target_name, source_identity, target_identity, authorization, admin_token):
         self.gateways, self.group = gateways, group
@@ -39,7 +43,7 @@ class Checkpoints:
 
     def finish(self):
         status = self.admin("backends/" + self.source + "/drain", "POST")
-        if status.status != 200 or status.json()["openTransactions"] < 1 or status.json()["drained"]:
+        if status.status != 200 or status.json()["openTransactions"] < 1 or status.json()["drained"] or status.json().get("readyToSeal", False):
             raise AssertionError("Open checkpoint transaction must block drain after load")
         blocked = self.admin("backends/" + self.source + "/seal", "POST", {"generation": status.json()["generation"]})
         if blocked.status != 409:
@@ -60,12 +64,14 @@ class Checkpoints:
             if status.status != 200:
                 raise AssertionError("Post-load drain status failed")
             if status.json()["readyToSeal"]:
+                if not no_obligations(status.json()):
+                    raise AssertionError("Post-load drain claims readiness with outstanding obligations")
                 break
             if time.monotonic() >= deadline:
                 raise AssertionError("Post-load obligations remain; do not reset the ledger to hide this failure")
             time.sleep(.1)
         sealed = self.admin("backends/" + self.source + "/seal", "POST", {"generation": status.json()["generation"]})
-        if sealed.status != 200 or not sealed.json()["drained"]:
+        if sealed.status != 200 or not sealed.json()["drained"] or not no_obligations(sealed.json()):
             raise AssertionError("Final seal failed after all observed obligations completed")
         resumed = self.admin("backends/" + self.source + "/resume", "POST", {"generation": sealed.json()["generation"]})
         restored = self.admin("cutover", "POST", {"routingGroup": self.group, "backendName": self.source})
