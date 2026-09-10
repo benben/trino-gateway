@@ -36,6 +36,7 @@ import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService;
+import io.trino.gateway.ha.transaction.TransactionAwarenessService.RequestContext;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
@@ -186,6 +187,7 @@ public class ProxyRequestHandler
             AsyncResponse asyncResponse,
             Request.Builder requestBuilder)
     {
+        RequestContext context = transactionAwareness == null ? null : transactionAwareness.captureRequestContext(servletRequest);
         try {
             URI remoteUri = routingDestination.clusterUri();
             requestBuilder.setUri(remoteUri);
@@ -199,8 +201,8 @@ public class ProxyRequestHandler
                     .setFollowRedirects(false)
                     .build();
 
-            if (transactionAwareness != null && transactionAwareness.hasRequestCapacity(servletRequest)) {
-                performBoundedRequest(routingDestination, servletRequest, asyncResponse, requestBuilder, cookieBuilder);
+            if (context != null) {
+                performBoundedRequest(routingDestination, context, asyncResponse, requestBuilder, cookieBuilder);
                 return;
             }
 
@@ -232,20 +234,20 @@ public class ProxyRequestHandler
                             .catching(ProxyException.class, e -> handleProxyException(request, e), directExecutor()));
         }
         catch (RuntimeException failure) {
-            if (transactionAwareness != null && transactionAwareness.hasRequestCapacity(servletRequest) && !transactionAwareness.isCompletionManaged(servletRequest)) {
-                if (transactionAwareness.wasDispatched(servletRequest)) {
+            if (context != null && !context.isCompletionManaged()) {
+                if (context.wasDispatched()) {
                     try {
                         transactionAwareness.completionPhase(() -> {
-                            transactionAwareness.requestFailed(servletRequest);
+                            transactionAwareness.requestFailed(context);
                             return null;
                         });
                     }
                     finally {
-                        transactionAwareness.completeRequest(servletRequest);
+                        context.close();
                     }
                 }
                 else {
-                    transactionAwareness.requestRejectedBeforeDispatch(servletRequest);
+                    transactionAwareness.requestRejectedBeforeDispatch(context);
                 }
             }
             throw failure;
@@ -254,14 +256,14 @@ public class ProxyRequestHandler
 
     private void performBoundedRequest(
             RoutingDestination destination,
-            HttpServletRequest servletRequest,
+            RequestContext context,
             AsyncResponse asyncResponse,
             Request.Builder requestBuilder,
             ImmutableList.Builder<NewCookie> cookieBuilder)
     {
-        Duration remaining = transactionAwareness.remainingRequestTime(servletRequest);
+        Duration remaining = context.remainingTime();
         Request request = requestBuilder.setRequestTimeout(remaining).setIdleTimeout(remaining).build();
-        transactionAwareness.beforeDispatch(servletRequest);
+        context.beforeDispatch();
         FluentFuture<ProxyResponse> backend = executeHttp(request);
         SettableFuture<Response> completed = SettableFuture.create();
         AtomicBoolean completionStarted = new AtomicBoolean();
@@ -289,10 +291,9 @@ public class ProxyRequestHandler
                         throw new ProxyException("Backend request outcome is uncertain", failure);
                     }
                     Response result = transactionAwareness.completionPhase(() -> {
-                        ProxyResponse recorded = transactionAwareness.recordResponse(servletRequest, response);
+                        ProxyResponse recorded = transactionAwareness.recordResponse(context, response);
                         if (request.getMethod().equals(HttpMethod.POST)) {
-                            Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
-                            recorded = recordBackendForQueryId(request, recorded, username, destination);
+                            recorded = recordBackendForQueryId(request, recorded, context.username(), destination);
                             if (includeClusterInfoInResponse) {
                                 cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(request.getUri().getHost()).build());
                             }
@@ -304,7 +305,7 @@ public class ProxyRequestHandler
                 catch (Throwable outcomeFailure) {
                     try {
                         transactionAwareness.completionPhase(() -> {
-                            transactionAwareness.requestFailed(servletRequest);
+                            transactionAwareness.requestFailed(context);
                             return null;
                         });
                     }
@@ -316,11 +317,11 @@ public class ProxyRequestHandler
                                                         .entity("Backend request outcome is uncertain; the request was not reassigned").build()));
                 }
                 finally {
-                    transactionAwareness.completeRequest(servletRequest);
+                    context.close();
                 }
             }
         }, transactionAwareness.completionExecutor());
-        transactionAwareness.manageCompletion(servletRequest);
+        context.manageCompletion();
         Duration clientTimeout = new Duration(Math.min(asyncTimeout.toMillis(), Math.max(1, remaining.toMillis())), java.util.concurrent.TimeUnit.MILLISECONDS);
         bindAsyncResponse(asyncResponse, nonCancellationPropagating(completed), directExecutor())
                 .withTimeout(clientTimeout, () -> Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)

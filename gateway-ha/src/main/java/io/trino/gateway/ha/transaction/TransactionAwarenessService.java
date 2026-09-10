@@ -33,6 +33,7 @@ import io.trino.gateway.ha.handler.schema.RoutingDestination;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
+import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
 import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
@@ -65,6 +66,7 @@ import java.util.function.Supplier;
 
 import static io.airlift.http.client.Request.Builder.prepareGet;
 import static io.airlift.http.client.StringResponseHandler.createStringResponseHandler;
+import static io.trino.gateway.ha.handler.HttpUtils.TRINO_REQUEST_USER;
 import static io.trino.gateway.ha.handler.ProxyUtils.buildUriWithNewCluster;
 import static io.trino.gateway.ha.handler.ProxyUtils.extractQueryIdIfPresent;
 import static io.trino.gateway.ha.persistence.DatabaseDeadline.withDeadline;
@@ -199,14 +201,68 @@ public class TransactionAwarenessService
         }
     }
 
-    public boolean hasRequestCapacity(HttpServletRequest request)
+    public RequestContext captureRequestContext(HttpServletRequest request)
     {
-        return request.getAttribute(CAPACITY_ATTRIBUTE) instanceof TransactionRequestCapacity.Lease;
+        if (!(request.getAttribute(CAPACITY_ATTRIBUTE) instanceof TransactionRequestCapacity.Lease lease)) {
+            return null;
+        }
+        Optional<String> username = request.getAttribute(TRINO_REQUEST_USER) instanceof TrinoRequestUser user ? user.getUser() : Optional.empty();
+        return new RequestContext(admission(request), lease, request.getMethod(), request.getRequestURI(), username);
     }
 
-    public Duration remainingRequestTime(HttpServletRequest request)
+    public static final class RequestContext
+            implements AutoCloseable
     {
-        return ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).remaining();
+        private final Admission admission;
+        private final TransactionRequestCapacity.Lease lease;
+        private final String method;
+        private final String requestUri;
+        private final Optional<String> username;
+
+        private RequestContext(Admission admission, TransactionRequestCapacity.Lease lease, String method, String requestUri, Optional<String> username)
+        {
+            this.admission = admission;
+            this.lease = lease;
+            this.method = method;
+            this.requestUri = requestUri;
+            this.username = username;
+        }
+
+        public Optional<String> username()
+        {
+            return username;
+        }
+
+        public Duration remainingTime()
+        {
+            return lease.remaining();
+        }
+
+        public void beforeDispatch()
+        {
+            lease.dispatch();
+        }
+
+        public boolean wasDispatched()
+        {
+            return lease.isDispatched();
+        }
+
+        public void manageCompletion()
+        {
+            lease.manageCompletion();
+        }
+
+        public boolean isCompletionManaged()
+        {
+            return lease.isCompletionManaged();
+        }
+
+        @Override
+        public void close()
+        {
+            lease.close();
+        }
     }
 
     public Executor completionExecutor()
@@ -217,26 +273,6 @@ public class TransactionAwarenessService
     public <T> T completionPhase(Supplier<T> action)
     {
         return withDeadline(System.nanoTime() + MILLISECONDS.toNanos(config.getCompletionTimeoutMillis()), false, action);
-    }
-
-    public void beforeDispatch(HttpServletRequest request)
-    {
-        ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).dispatch();
-    }
-
-    public boolean wasDispatched(HttpServletRequest request)
-    {
-        return hasRequestCapacity(request) && ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).isDispatched();
-    }
-
-    public void manageCompletion(HttpServletRequest request)
-    {
-        ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).manageCompletion();
-    }
-
-    public boolean isCompletionManaged(HttpServletRequest request)
-    {
-        return hasRequestCapacity(request) && ((TransactionRequestCapacity.Lease) request.getAttribute(CAPACITY_ATTRIBUTE)).isCompletionManaged();
     }
 
     public void completeRequest(HttpServletRequest request)
@@ -256,13 +292,22 @@ public class TransactionAwarenessService
 
     public ProxyResponse recordResponse(HttpServletRequest request, ProxyResponse response)
     {
-        Admission admission = admission(request);
+        return recordResponse(admission(request), request.getMethod(), request.getRequestURI(), response);
+    }
+
+    public ProxyResponse recordResponse(RequestContext context, ProxyResponse response)
+    {
+        return recordResponse(context.admission, context.method, context.requestUri, response);
+    }
+
+    private ProxyResponse recordResponse(Admission admission, String method, String requestUri, ProxyResponse response)
+    {
         if (admission == null) {
             return response;
         }
         return guarded(() -> {
-            boolean rejectedContinuation = response.statusCode() == 404 && List.of("GET", "HEAD", "DELETE").contains(request.getMethod());
-            boolean completedCancellation = response.statusCode() == 204 && request.getMethod().equals("DELETE");
+            boolean rejectedContinuation = response.statusCode() == 404 && List.of("GET", "HEAD", "DELETE").contains(method);
+            boolean completedCancellation = response.statusCode() == 204 && method.equals("DELETE");
             if ((rejectedContinuation || completedCancellation) && admission.queryId() != null &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
                 store.rejectAdmission(admission.id());
@@ -278,7 +323,7 @@ public class TransactionAwarenessService
                 store.markUncertain(admission.id());
                 return response;
             }
-            if (request.getMethod().equals("HEAD")) {
+            if (method.equals("HEAD")) {
                 if (responseHeader(response, "X-Trino-Started-Transaction-Id").isPresent() || responseHeader(response, "X-Trino-Clear-Transaction-Id").isPresent()) {
                     throw error(502, "Backend returned transaction lifecycle headers on a heartbeat");
                 }
@@ -292,7 +337,7 @@ public class TransactionAwarenessService
             catch (IOException e) {
                 throw error(502, "Backend returned malformed query results");
             }
-            if (request.getRequestURI().startsWith("/v1/query/") && request.getMethod().equals("GET")) {
+            if (requestUri.startsWith("/v1/query/") && method.equals("GET")) {
                 if (responseHeader(response, "X-Trino-Started-Transaction-Id").isPresent() || responseHeader(response, "X-Trino-Clear-Transaction-Id").isPresent()) {
                     throw error(502, "Backend returned transaction lifecycle headers on query metadata");
                 }
@@ -346,7 +391,16 @@ public class TransactionAwarenessService
 
     public void requestFailed(HttpServletRequest request)
     {
-        Admission admission = admission(request);
+        requestFailed(admission(request));
+    }
+
+    public void requestFailed(RequestContext context)
+    {
+        requestFailed(context.admission);
+    }
+
+    private void requestFailed(Admission admission)
+    {
         if (admission != null) {
             try {
                 store.markUncertain(admission.id());
@@ -370,6 +424,21 @@ public class TransactionAwarenessService
         }
         finally {
             completeRequest(request);
+        }
+    }
+
+    public void requestRejectedBeforeDispatch(RequestContext context)
+    {
+        try {
+            if (context.admission != null) {
+                completionPhase(() -> guarded(() -> {
+                    store.rejectAdmission(context.admission.id());
+                    return null;
+                }));
+            }
+        }
+        finally {
+            context.close();
         }
     }
 

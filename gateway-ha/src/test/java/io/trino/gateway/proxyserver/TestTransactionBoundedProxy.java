@@ -27,6 +27,7 @@ import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingManager;
+import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import io.trino.gateway.ha.transaction.TransactionStore;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
@@ -37,6 +38,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.AsyncResponse;
 import jakarta.ws.rs.container.TimeoutHandler;
+import jakarta.ws.rs.core.Response;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -54,15 +56,18 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static io.trino.gateway.ha.handler.HttpUtils.TRINO_REQUEST_USER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -77,6 +82,8 @@ class TestTransactionBoundedProxy
     private ProxyRequestHandler handler;
     private HttpClient proxy;
     private SettableFuture<ProxyResponse> raw;
+    private HttpServletRequest lastOriginalRequest;
+    private QueryHistoryManager history;
 
     @BeforeEach
     void setup()
@@ -105,7 +112,8 @@ class TestTransactionBoundedProxy
         raw = SettableFuture.create();
         HttpResponseFuture<?> future = new TestingResponseFuture(raw);
         doReturn(future).when(proxy).executeAsync(any(), any());
-        handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), mock(QueryHistoryManager.class), config);
+        history = mock(QueryHistoryManager.class);
+        handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), history, config);
         handler.setTransactionAwareness(service);
     }
 
@@ -183,14 +191,122 @@ class TestTransactionBoundedProxy
             throws Exception
     {
         RoutingTargetResponse target = resolve();
+        HttpServletRequest original = lastOriginalRequest;
         AsyncResponse client = mock(AsyncResponse.class);
-        doAnswer(_ -> { throw new IllegalStateException("synthetic client binding failure"); }).when(client).setTimeoutHandler(any());
+        doAnswer(_ -> {
+            recycle(original);
+            throw new IllegalStateException("synthetic client binding failure");
+        }).when(client).setTimeoutHandler(any());
         assertThatThrownBy(() -> handler.getRequest(target.modifiedRequest(), client, target.routingDestination()))
                 .isInstanceOf(IllegalStateException.class);
         assertOverloaded();
         raw.set(results());
         awaitAvailable();
         verify(store, never()).markUncertain(any());
+    }
+
+    @Test
+    void completedClientCanRecycleServletBeforeLeaseRelease()
+            throws Exception
+    {
+        RoutingTargetResponse target = resolve();
+        HttpServletRequest original = lastOriginalRequest;
+        AsyncResponse client = mock(AsyncResponse.class);
+        doAnswer(_ -> {
+            recycle(original);
+            return true;
+        }).when(client).resume(any(Response.class));
+        handler.getRequest(target.modifiedRequest(), client, target.routingDestination());
+        raw.set(results());
+        verify(client, timeout(1000)).resume(any(Response.class));
+        awaitAvailable();
+    }
+
+    @Test
+    void timedOutClientCanRecycleServletBeforeOutcomeProcessing()
+            throws Exception
+    {
+        RoutingTargetResponse target = resolve();
+        HttpServletRequest original = lastOriginalRequest;
+        Admission expected = (Admission) target.modifiedRequest().getAttribute(TransactionAwarenessService.class.getName() + ".admission");
+        AsyncResponse client = mock(AsyncResponse.class);
+        doAnswer(_ -> {
+            recycle(original);
+            return true;
+        }).when(client).resume(any(Response.class));
+        handler.getRequest(target.modifiedRequest(), client, target.routingDestination());
+        ArgumentCaptor<TimeoutHandler> callback = ArgumentCaptor.forClass(TimeoutHandler.class);
+        verify(client).setTimeoutHandler(callback.capture());
+        callback.getValue().handleTimeout(client);
+        assertThat(raw.isCancelled()).isFalse();
+        assertOverloaded();
+        raw.set(results());
+        verify(store, timeout(1000)).recordResponse(eq(expected.id()), any());
+        awaitAvailable();
+    }
+
+    private static void recycle(HttpServletRequest original)
+    {
+        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet attributes"); }).when(original).getAttribute(anyString());
+        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet method"); }).when(original).getMethod();
+        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet URI"); }).when(original).getRequestURI();
+    }
+
+    @Test
+    void timedOutSubmissionPreservesCapturedUsernameAndAdmission()
+            throws Exception
+    {
+        RoutingTargetResponse target = resolve();
+        HttpServletRequest original = lastOriginalRequest;
+        when(original.getMethod()).thenReturn("POST");
+        when(original.getRequestURI()).thenReturn("/v1/statement");
+        TrinoRequestUser user = mock(TrinoRequestUser.class);
+        when(user.getUser()).thenReturn(Optional.of("synthetic-user"));
+        original.setAttribute(TRINO_REQUEST_USER, user);
+        Admission expected = (Admission) target.modifiedRequest().getAttribute(TransactionAwarenessService.class.getName() + ".admission");
+        AsyncResponse client = mock(AsyncResponse.class);
+        doAnswer(_ -> {
+            recycle(original);
+            return true;
+        }).when(client).resume(any(Response.class));
+        handler.postRequest("SELECT 1", target.modifiedRequest(), client, target.routingDestination());
+        ArgumentCaptor<TimeoutHandler> callback = ArgumentCaptor.forClass(TimeoutHandler.class);
+        verify(client).setTimeoutHandler(callback.capture());
+        callback.getValue().handleTimeout(client);
+        raw.set(results());
+        verify(store, timeout(1000)).recordResponse(eq(expected.id()), any());
+        ArgumentCaptor<QueryHistoryManager.QueryDetail> detail = ArgumentCaptor.forClass(QueryHistoryManager.QueryDetail.class);
+        verify(history, timeout(1000)).submitQueryDetail(detail.capture());
+        assertThat(detail.getValue().getUser()).isEqualTo("synthetic-user");
+        awaitAvailable();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void failedOutcomeAfterRecyclingMarksOriginalAdmissionUncertain(boolean transportFailure)
+            throws Exception
+    {
+        RoutingTargetResponse target = resolve();
+        HttpServletRequest original = lastOriginalRequest;
+        Admission expected = (Admission) target.modifiedRequest().getAttribute(TransactionAwarenessService.class.getName() + ".admission");
+        AsyncResponse client = mock(AsyncResponse.class);
+        doAnswer(_ -> {
+            recycle(original);
+            return true;
+        }).when(client).resume(any(Response.class));
+        handler.getRequest(target.modifiedRequest(), client, target.routingDestination());
+        ArgumentCaptor<TimeoutHandler> callback = ArgumentCaptor.forClass(TimeoutHandler.class);
+        verify(client).setTimeoutHandler(callback.capture());
+        callback.getValue().handleTimeout(client);
+        if (transportFailure) {
+            raw.setException(new IllegalStateException("Synthetic backend failure"));
+        }
+        else {
+            raw.set(new ProxyResponse(200, ImmutableListMultimap.of(), "{"));
+        }
+        verify(store, timeout(1000)).markUncertain(expected.id());
+        verify(store, never()).recordResponse(any(), any());
+        awaitAvailable();
     }
 
     @ParameterizedTest
@@ -218,6 +334,7 @@ class TestTransactionBoundedProxy
     private RoutingTargetResponse resolve(String method)
     {
         HttpServletRequest request = mock(HttpServletRequest.class);
+        lastOriginalRequest = request;
         Map<String, Object> attributes = new HashMap<>();
         when(request.getMethod()).thenReturn(method);
         when(request.getRequestURI()).thenReturn(PATH);

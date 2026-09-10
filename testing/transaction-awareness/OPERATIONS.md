@@ -49,6 +49,10 @@ After dispatch, client timeout or cancellation does not cancel outcome processin
 or release its capacity slot. The admission remains a drain blocker until its
 actual outcome is recorded. Failures retain uncertainty; Gateway does not resubmit.
 
+Completion uses a snapshot of the admission, request method, URI and user, plus
+the original capacity lease. It does not read the servlet request after dispatch:
+the server can recycle that object after client timeout or response delivery.
+
 Completion database work receives a fresh `completionTimeoutMillis` budget so it
 can record facts after a client timeout. These are bounded phases, not hard
 real-time cancellation guarantees: JDBC timeout rounding, cancellation delivery,

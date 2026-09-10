@@ -82,7 +82,7 @@ The live deadline regression passed on the published image with the same 500 ms
 routing budget used for its baseline failure. Full Kubernetes protocol, native
 JDBC, restart and load reruns are not yet complete at this checkpoint.
 
-### Live gate failure under investigation
+### Live gate failure and recycling regression
 
 The published `2adce62` candidate is not accepted for transaction-aware use.
 Two independent labs exhausted their per-process request capacity during ordinary
@@ -93,8 +93,24 @@ This is leaked process capacity, not a legitimate durable admission backlog.
 The overload/normal runner stopped during overload setup, before its normal
 contract cases. The fault runner passed four capability cases and then stopped
 during the next case's setup. These are failed acceptance runs, not passing suites.
-Their ledger state is preserved. A regression for servlet-request recycling and
-asynchronous completion is being developed before the complete live rerun.
+Their ledger state is preserved. Sanitized Gateway exception traces point to
+`completeRequest` inside the proxy's completion callback, where a recycled
+servlet request no longer has its lease attribute.
+
+Two new deterministic tests reproduced the failure before repair: recycling the
+servlet at response delivery leaked capacity, and recycling it at client timeout
+prevented recording the original admission. The repair captures admission, lease,
+method, URI and user before dispatch. Completion and failure handlers use that
+snapshot, including their cleanup paths. The real PostgreSQL completion test now
+also recycles the servlet at timeout. Complete live acceptance must still be
+rerun on the replacement image before this failure is considered resolved.
+
+The integrated repair passed 220 Java tests with zero failures, errors or skips,
+using the command above plus `TestRouteToBackendResource` in its test selector.
+It also covers recycled-request transport failure, malformed responses, POST
+user capture and response-binding failure. The original admission remains the
+target of completion or uncertainty recording, and the slot releases only after
+that processing finishes.
 
 ## Interpretation limits
 

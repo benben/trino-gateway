@@ -37,6 +37,7 @@ import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.ws.rs.container.AsyncResponse;
 import jakarta.ws.rs.container.TimeoutHandler;
+import jakarta.ws.rs.core.Response;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -152,9 +153,16 @@ class TestTransactionPooledCompletion
                 ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), mock(QueryHistoryManager.class), configuration);
                 handler.setTransactionAwareness(service);
                 try {
-                    var target = service.resolve(request(), () -> { throw new AssertionError("Unexpected ordinary routing"); }, _ -> { throw new AssertionError("Unexpected backend selection"); });
+                    HttpServletRequest original = request();
+                    var target = service.resolve(original, () -> { throw new AssertionError("Unexpected ordinary routing"); }, _ -> { throw new AssertionError("Unexpected backend selection"); });
                     UUID pending = observer.withHandle(handle -> handle.createQuery("SELECT admission_id FROM transaction_admission WHERE state = 'PENDING'").mapTo(UUID.class).one());
                     AsyncResponse client = mock(AsyncResponse.class);
+                    doAnswer(_ -> {
+                        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet attributes"); }).when(original).getAttribute(anyString());
+                        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet method"); }).when(original).getMethod();
+                        doAnswer(_ -> { throw new IllegalStateException("Recycled servlet URI"); }).when(original).getRequestURI();
+                        return true;
+                    }).when(client).resume(any(Response.class));
                     handler.getRequest(target.modifiedRequest(), client, target.routingDestination());
                     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                     try (var one = DatabaseDeadline.withDeadline(deadline, true, pooled::open);
