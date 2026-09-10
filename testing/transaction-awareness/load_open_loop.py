@@ -205,7 +205,7 @@ class VerifiedNameConnection(http.client.HTTPSConnection):
 class OpenLoop:
     def __init__(self, gateways, groups, authorization, *, rate, duration, concurrency=128,
                  timeout=10, maximum_lag=.05, transport=None, expected_backends=None,
-                 measurement_start_utc=None, processes=1):
+                 measurement_start_utc=None, processes=1, query_owners=None, cutover_control=None):
         if not gateways or not groups or not authorization:
             raise ValueError("Explicit gateways, routing groups, and runtime authorization are required")
         if not 1 <= rate <= 10000 or not 0 < duration <= 600 or rate * duration > 1_000_000:
@@ -221,6 +221,15 @@ class OpenLoop:
             raise ValueError("Eight processes require a supported aggregate rate, divisible capacity, and independent transports")
         self.processes = processes
         self.rotation_offset = 0
+        self.query_owners = query_owners
+        self.owner_policy = None
+        if query_owners is not None:
+            from load_cutover import QueryOwners
+            self.owner_policy = QueryOwners(query_owners)
+        if cutover_control is not None and (processes != 8 or query_owners is None):
+            raise ValueError("Concurrent cutover requires eight processes and verified query owners")
+        self.cutover_control = cutover_control
+        self.cutover_samples = []
         self.gateways, self.groups, self.authorization = gateways, groups, authorization
         self.rate, self.duration, self.concurrency = rate, duration, concurrency
         self.timeout = timeout
@@ -265,8 +274,11 @@ class OpenLoop:
                     self.counts["started_in_window"] += 1
                 self.record_window_event(started, "started")
         headers = {}
+        expected_query, expected_owner, owner = None, -1, -1
         if continuation:
-            path, expected_backend = continuation
+            path, expected_backend = continuation[:2]
+            if self.owner_policy is not None:
+                expected_query, expected_owner = continuation[2:]
             method, body = "GET", None
         else:
             method, path, body = "POST", "/v1/statement", "SELECT 1"
@@ -281,10 +293,16 @@ class OpenLoop:
             index = (self.method_counts[method] + self.rotation_offset + (1 if method == "GET" else 0)) % len(self.gateways)
             self.method_counts[method] += 1
         status, payload, error, response_category = None, None, None, None
+        transport_started = time.monotonic()
         try:
             status, raw = self.transport.request(index, method, path, body, headers)
             if status == 200:
                 payload = json.loads(raw)
+                if self.owner_policy is not None:
+                    owner, query_id = self.owner_policy.observe(payload)
+                    if expected_query is not None and (query_id != expected_query or owner != expected_owner):
+                        raise ValueError("Continuation changed its initial query identity or owner")
+                    expected_backend = self.owner_policy.identities[owner]
                 if "error" in payload:
                     error = "sql_error"
                 if expected_backend is not None and payload.get("data") != [[expected_backend]] and not payload.get("nextUri"):
@@ -308,6 +326,11 @@ class OpenLoop:
             if response_category:
                 self.response_error_categories["cleanup" if cleanup else "measured"][response_category] += 1
             if not cleanup:
+                if self.owner_policy is not None:
+                    self.cutover_samples.append([0 if method == "POST" else 1,
+                        started - self.window_beginning, transport_started - self.window_beginning,
+                        finished - self.window_beginning, scheduled - self.window_beginning,
+                        status or 0, int(error is not None), owner, expected_owner])
                 self.latencies.append((finished - started) * 1000)
                 self.corrected_latencies.append((finished - scheduled) * 1000)
                 if finished <= end:
@@ -319,7 +342,10 @@ class OpenLoop:
             if payload and not error:
                 if payload.get("nextUri"):
                     uri = urlsplit(payload["nextUri"])
-                    self.pending.append((uri.path + ("?" + uri.query if uri.query else ""), expected_backend))
+                    continuation = (uri.path + ("?" + uri.query if uri.query else ""), expected_backend)
+                    if self.owner_policy is not None:
+                        continuation += (query_id, owner)
+                    self.pending.append(continuation)
                 else:
                     self.counts["sql_completed"] += 1
                     for row in payload.get("data", []):

@@ -61,11 +61,14 @@ def worker(connection, index, configuration, transport_factory=None):
         loop = OpenLoop(gateways, groups, authorization, rate=rate / PROCESSES,
                         transport=transport_factory() if transport_factory else None, **options)
         result = loop.run(_phase=ChildPhase(connection, index, rate))
-        send(connection, {"kind": "result", "process_index": index, "report": {
+        report = {
             "process_index": index, "process_count": PROCESSES,
             "schedule_offset_seconds": index / rate, "schedule_stride_seconds": PROCESSES / rate,
             "result": result, "raw_samples": {"latency_ms": loop.latencies,
-                "scheduled_latency_ms": loop.corrected_latencies, "client_lag_ms": loop.lags}}})
+                "scheduled_latency_ms": loop.corrected_latencies, "client_lag_ms": loop.lags}}
+        if loop.owner_policy is not None:
+            report["cutover_samples"] = loop.cutover_samples
+        send(connection, {"kind": "result", "process_index": index, "report": report})
     except BaseException as error:
         try:
             send(connection, {"kind": "error", "process_index": index, "error_type": type(error).__name__})
@@ -192,12 +195,16 @@ def run_multiprocess(loop, *, transport_factory=None, worker_target=worker, setu
                          rate=loop.rate, duration=loop.duration, concurrency=loop.concurrency,
                          timeout=loop.timeout, maximum_lag=loop.maximum_lag,
                          expected_backends=loop.expected_backends,
+                         query_owners=loop.query_owners,
                          measurement_start_utc=None if loop.measurement_start is None else stamp(loop.measurement_start))
     snapshots = {"before_setup": read_client_cpu()}
     setup_beginning = time.monotonic()
     cleanup_budget = min(120, max(30, loop.timeout * 2)) + loop.timeout + 30
     supervisor = Supervision(setup_timeout + 601 + loop.duration + loop.timeout + cleanup_budget + 30)
     reports = []
+    control = loop.cutover_control
+    accepted = False
+    stage = "worker_setup"
     try:
         context = multiprocessing.get_context("spawn")
         for index in range(PROCESSES):
@@ -230,7 +237,12 @@ def run_multiprocess(loop, *, transport_factory=None, worker_target=worker, setu
             raise ValueError("Scheduled measurement start was missed")
         for connection in supervisor.connections:
             send(connection, {"kind": "start", "monotonic": beginning, "utc": stamp(window), "drift": drift})
+        if control is not None:
+            control.start(beginning, beginning + loop.duration, window)
+        stage = "background_completion"
         supervisor.collect("completed", beginning + loop.duration + loop.timeout + 30)
+        stage = "cutover_control"
+        event = control.finish_control() if control is not None else None
         completed_elapsed = time.monotonic() - beginning
         snapshots["after_completion"] = read_client_cpu()
         for connection in supervisor.connections:
@@ -246,10 +258,37 @@ def run_multiprocess(loop, *, transport_factory=None, worker_target=worker, setu
                                  planned_window_start_utc=None if loop.measurement_start is None else stamp(loop.measurement_start),
                                  measurement_start_drift_seconds=drift, cgroup_cpu=client_cpu_diagnostics(snapshots),
                                  completion_elapsed_seconds=completed_elapsed, client_setup_seconds=setup_elapsed)
+        if control is not None:
+            stage = "cutover_ownership_and_overlap"
+            from load_cutover_aggregate import summarize_cutover
+            result["cutover_metrics"] = summarize_cutover(reports, duration=loop.duration,
+                cutover_start_seconds=event["cutover_start_seconds"], cutover_ack_seconds=event["cutover_ack_seconds"])
+            result["cutover_control"] = event
+            checks = result["cutover_metrics"]["ownership_checks"]
+            if any(checks[name] <= 0 for name in ("pre_cutover_post_responses", "post_ack_post_starts", "pinned_continuations")):
+                raise ValueError("Cutover lacks positive request ownership evidence")
+            acknowledged, proved = event["cutover_ack_seconds"], event["proofs_completed_seconds"]
+            if loop.duration - proved < 10:
+                raise ValueError("Cutover proofs leave less than ten seconds of traffic")
+            records = [row for child in reports for row in child["cutover_samples"]]
+            intervals = {}
+            for name, lower, upper in (("during_proofs", acknowledged, proved), ("after_proofs", proved, loop.duration)):
+                intervals[name] = {"started": sum(lower < row[1] <= upper for row in records),
+                                   "completed": sum(lower < row[3] <= upper for row in records)}
+                if min(intervals[name].values()) <= 0:
+                    raise ValueError("No background traffic overlaps the control proof or its tail")
+            result["cutover_background_overlap"] = intervals
+            result["cutover_control_valid"] = True
         if not supervisor.close() or supervisor.expired.is_set() or time.monotonic() >= supervisor.deadline:
             raise TimeoutError("Process supervision did not finish within its deadline")
+        accepted = True
         return result
     except Exception as error:
-        return failure_receipt(loop, error, reports, snapshots)
+        failed = failure_receipt(loop, error, reports, snapshots)
+        if control is not None:
+            failed["cutover_failure"] = {"stage": stage, "event": dict(control.event)}
+        return failed
     finally:
         supervisor.close()
+        if control is not None and not accepted:
+            control.cancel()

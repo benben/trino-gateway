@@ -56,6 +56,22 @@ def validate(case):
     processes = case.get("client_processes", 1)
     if type(processes) is not int or processes not in (1, 8) or (processes == 8 and case.get("concurrency", 128) % 8):
         raise ValueError("Use one or eight processes with divisible aggregate capacity")
+    if "cutover_during_load" in case:
+        if (case["cutover_during_load"] != {"offset_seconds": 30} or case["replicas"] != 20 or
+                case["rate"] != 1000 or case["duration"] != 60 or case["warmup"] != 10 or
+                processes != 8 or case.get("concurrency") != 512 or len(groups) != 1):
+            raise ValueError("Concurrent cutover requires the explicit bounded twenty-Gateway profile")
+        urls = []
+        for prefix in ("source", "target"):
+            endpoint = urlsplit(groups[0].get(prefix + "_url", ""))
+            if (endpoint.scheme != "http" or endpoint.port != 8080 or endpoint.path or endpoint.query or
+                    endpoint.fragment or endpoint.username or endpoint.password or
+                    not ipaddress.ip_address(endpoint.hostname).is_private or
+                    not re.fullmatch(r"[0-9a-f]{64}", groups[0].get(prefix + "_process_sha256", ""))):
+                raise ValueError("Bind both fixture URLs to verified private process inventory")
+            urls.append(endpoint.geturl())
+        if len(set(urls)) != 2:
+            raise ValueError("Cutover fixtures must have distinct process endpoints")
 
 
 @contextmanager
@@ -96,16 +112,25 @@ def run(case, authorization, admin_token, runner, checkpoint_factory, is_invalid
         result["stages"].append({"name": stage, "start_utc": utc()})
         with phase(60):
             for group in case["groups"]:
-                checkpoint = checkpoint_factory(gateways, group["name"], group["source"], group["target"],
-                                                group["source_identity"], group["target_identity"], authorization, admin_token)
+                arguments = (gateways, group["name"], group["source"], group["target"],
+                             group["source_identity"], group["target_identity"], authorization, admin_token)
+                if "cutover_during_load" in case:
+                    from load_cutover import CutoverCheckpoint
+                    checkpoint = CutoverCheckpoint(*arguments, fixture_group=group)
+                else:
+                    checkpoint = checkpoint_factory(*arguments)
                 checkpoints.append(checkpoint)
                 checkpoint.begin()
         result["stages"][-1]["end_utc"] = utc()
         stage = "measurement_and_continuation_cleanup"
         result["stages"].append({"name": stage, "start_utc": utc()})
+        if "cutover_during_load" in case:
+            options.update(query_owners=checkpoints[0].owner_configuration, cutover_control=checkpoints[0])
         result["measurement"] = runner(gateways, groups, authorization, duration=case["duration"],
                                        measurement_start_utc=case.get("measurement_start_utc"), **options).run()
         result["stages"][-1]["end_utc"] = utc()
+        if "cutover_during_load" in case and result["measurement"].get("cutover_control_valid") is not True:
+            raise AssertionError("Concurrent cutover failed; do not restore uncertain state")
         actual = result["measurement"].get("successful_http_rps")
         target_achieved = type(actual) in (int, float) and math.isfinite(actual) and actual >= .99 * case["rate"]
         result["target_acceptance"] = {"target_http_rps": case["rate"], "successful_http_rps": actual,

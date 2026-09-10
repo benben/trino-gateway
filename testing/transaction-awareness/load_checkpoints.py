@@ -41,21 +41,27 @@ class Checkpoints:
         if self.query("SELECT 1", self.transaction)[-1].json().get("data") != [[self.source_identity]]:
             raise AssertionError("Checkpoint transaction did not start on the expected source")
 
-    def finish(self):
+    def drain_and_block_seal(self):
         status = self.admin("backends/" + self.source + "/drain", "POST")
         if status.status != 200 or status.json()["openTransactions"] < 1 or status.json()["drained"] or status.json().get("readyToSeal", False):
             raise AssertionError("Open checkpoint transaction must block drain after load")
         blocked = self.admin("backends/" + self.source + "/seal", "POST", {"generation": status.json()["generation"]})
         if blocked.status != 409:
             raise AssertionError("Seal succeeded with an open checkpoint transaction")
+
+    def cutover(self):
         route = self.admin("cutover", "POST", {"routingGroup": self.group, "backendName": self.target})
         if route.status != 200:
             raise AssertionError("Post-load atomic cutover failed")
+
+    def prove_placement(self):
         for index in range(len(self.gateways)):
             if self.query("SELECT 1", self.transaction, index)[-1].json().get("data") != [[self.source_identity]]:
                 raise AssertionError("Existing transaction moved to the new backend")
             if self.query("SELECT 1", index=index)[-1].json().get("data") != [[self.target_identity]]:
                 raise AssertionError("New query did not use the cutover backend")
+
+    def settle_and_restore(self):
         self.query("ROLLBACK", self.transaction)
         self.transaction = None
         deadline = time.monotonic() + 150
@@ -77,6 +83,12 @@ class Checkpoints:
         restored = self.admin("cutover", "POST", {"routingGroup": self.group, "backendName": self.source})
         if resumed.status != 200 or restored.status != 200:
             raise AssertionError("Could not restore the disposable fixture after verified sealing")
+
+    def finish(self):
+        self.drain_and_block_seal()
+        self.cutover()
+        self.prove_placement()
+        self.settle_and_restore()
         return {"open_transaction_blocked_seal": True, "existing_transaction_pinned_after_cutover": True,
                 "new_queries_used_destination": True, "all_gateway_endpoints_checked": len(self.gateways),
                 "observed_final_drain_and_seal": True}

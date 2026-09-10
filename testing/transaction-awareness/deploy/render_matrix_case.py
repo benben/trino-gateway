@@ -15,6 +15,8 @@ def compose(renderer, namespace, name, case, sources, ca_certificate, *, priorit
         additional = {"load_multiprocess.py", "load_aggregate.py"}
         expected |= additional
         process_options = {"processes": 8, "process_sources": {name: sources.get(name) for name in additional}}
+    if "cutover_during_load" in case:
+        expected |= {"load_cutover.py", "load_cutover_aggregate.py"}
     if set(sources) != expected or any(not isinstance(source, str) or not source for source in sources.values()):
         raise ValueError("Bundle the reviewed load, TLS protocol, checkpoint, and wrapper sources")
     if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", admin_secret) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,253}", admin_secret_key):
