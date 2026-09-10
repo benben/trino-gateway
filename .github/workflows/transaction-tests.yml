@@ -48,4 +48,12 @@ jobs:
         run: python3 -m unittest -v test_fake_trino test_network_fault_proxy test_load_open_loop test_load_checkpoints test_database_metrics
       - name: Disposable lab tooling tests
         working-directory: testing/transaction-awareness/deploy
-        run: python3 -m unittest discover -p 'test_*.py' -v
+        env:
+          TX_OBSERVER_LOCAL_PG: "yes"
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
+          PGDATABASE: postgres
+          PGUSER: postgres
+        run: |
+          psql --version
+          python3 -m unittest discover -p 'test_*.py' -v
