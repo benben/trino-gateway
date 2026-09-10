@@ -3,11 +3,12 @@
 import json
 import re
 
-from render import TASK
+from render import TASK, validate_priority_class
 
 
 def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *, rate=100,
-               duration=60, warmup=10, expected_backends=None, concurrency=128):
+               duration=60, warmup=10, expected_backends=None, concurrency=128, priority_class=None):
+    priority_name = validate_priority_class(priority_class)
     if not re.fullmatch(r"gateway-tx-lab-[a-z0-9-]+", namespace) or not re.fullmatch(r"load-[a-z0-9-]+", name):
         raise ValueError("Use an explicit disposable namespace and unique load-* job")
     if not 1 <= rate <= 1000 or not 1 <= duration <= 300 or not 0 <= warmup <= 60 or not 1 <= concurrency <= 512:
@@ -28,7 +29,7 @@ def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *,
     job = {"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "namespace": namespace, "labels": labels},
            "spec": {"backoffLimit": 0, "activeDeadlineSeconds": duration + warmup + 180, "ttlSecondsAfterFinished": 3600,
                     "template": {"metadata": {"labels": labels}, "spec": {
-                        "restartPolicy": "Never", "automountServiceAccountToken": False, "preemptionPolicy": "Never",
+                        "restartPolicy": "Never", "automountServiceAccountToken": False, "preemptionPolicy": "Never", "priorityClassName": priority_name,
                         "securityContext": {"runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
                                             "seccompProfile": {"type": "RuntimeDefault"}},
                         "volumes": [{"name": "source", "configMap": {"name": name}}],

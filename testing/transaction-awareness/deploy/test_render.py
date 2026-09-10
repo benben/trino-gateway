@@ -57,13 +57,36 @@ class LabRenderTests(unittest.TestCase):
         self.assertEqual(custom, self.items)
 
     def test_benchmark_backends_have_explicit_resources_and_never_preempt(self):
-        items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True)["items"]
+        priority = {"metadata": {"name": "test-low", "labels": {"task": TASK}}, "value": -10,
+                    "preemptionPolicy": "Never", "globalDefault": False}
+        items = render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=priority)["items"]
         for item in items:
             if item["kind"] == "Deployment":
                 pod = item["spec"]["template"]["spec"]
                 self.assertEqual(pod["preemptionPolicy"], "Never")
+                self.assertEqual(pod["priorityClassName"], "test-low")
                 if item["metadata"]["name"].startswith("fixture-"):
                     self.assertEqual(pod["containers"][0]["resources"]["requests"], {"cpu": "1", "memory": "512Mi"})
+
+    def test_benchmark_rejects_absent_or_unsafe_priority_class(self):
+        safe = {"metadata": {"name": "test-low", "labels": {"task": TASK}}, "value": -10,
+                "preemptionPolicy": "Never", "globalDefault": False}
+        for value in (None, safe | {"value": 0}, safe | {"globalDefault": True},
+                      safe | {"preemptionPolicy": "PreemptLowerPriority"}, safe | {"metadata": {"name": "other-app"}}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                render(self.namespace, "synthetic-test-password", "fake", benchmark=True, priority_class=value)
+
+    def test_benchmark_without_explicit_class_fails_closed(self):
+        with self.assertRaises(ValueError):
+            render(self.namespace, "synthetic-test-password", "fake", benchmark=True)
+
+    def test_nonbenchmark_explicit_priority_keeps_small_fixture_resources(self):
+        priority = {"metadata": {"name": "test-low", "labels": {"task": TASK}}, "value": -10,
+                    "preemptionPolicy": "Never", "globalDefault": False}
+        items = render(self.namespace, "synthetic-test-password", "fake", extra_fixtures=["normal-blue"], priority_class=priority)["items"]
+        pod = next(item for item in items if item["kind"] == "Deployment" and item["metadata"]["name"] == "fixture-normal-blue")["spec"]["template"]["spec"]
+        self.assertEqual(pod["priorityClassName"], "test-low")
+        self.assertEqual(pod["containers"][0]["resources"]["requests"], {"cpu": "50m", "memory": "64Mi"})
 
     def test_network_is_namespace_scoped_and_real_trino_preserves_proxy_urls(self):
         network = next(item for item in self.items if item["kind"] == "NetworkPolicy")["spec"]

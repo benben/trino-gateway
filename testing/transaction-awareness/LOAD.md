@@ -98,7 +98,12 @@ two backends add about two hundred monitor probes per second, beyond measured
 client requests and request-time process checks. Include this background traffic
 when interpreting fixture CPU; keep cadence identical between versions.
 
-Create with `--without-real-trino --benchmark --gateway-image <verified-digest>`.
+Create with `--without-real-trino --benchmark --gateway-image <verified-digest> --priority-class <approved-test-class>`.
+The existing PriorityClass must have the task ownership label, a negative priority,
+`preemptionPolicy: Never`, and `globalDefault: false`. Obtain explicit approval before
+creating this cluster-scoped test resource. The helper never adopts another application's class.
+Pass the verified class object as `priority_class` to `render_job` and database setup.
+Setting the pod's preemption policy alone does not override priority admission.
 Benchmark fixtures request 1 CPU/512 MiB. Review eligible node CPU, memory,
 pod-IP capacity, and quota before external database setup or replica increases.
 
@@ -107,7 +112,8 @@ python3 testing/transaction-awareness/deploy/lab.py \
   --context '<authorized-development-context>' \
   --namespace 'gateway-tx-lab-<unique-id>' configure-load \
   --database-config '<private-database-json>' --database-ca '<public-ca-file>' \
-  --database-address '<private-database-ip>' --replicas 2 --capacity-reviewed
+  --database-address '<private-database-ip>' --replicas 2 --capacity-reviewed \
+  --priority-class '<approved-test-class>'
 ```
 
 Database JSON contains only `jdbcUrl`, `user`, `password`, and `driver`.

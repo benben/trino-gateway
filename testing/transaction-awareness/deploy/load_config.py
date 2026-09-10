@@ -4,10 +4,11 @@ import copy
 import ipaddress
 from urllib.parse import parse_qs, urlsplit
 
-from render import TASK
+from render import TASK, validate_priority_class
 
 
-def prepare(config, database, addresses, replicas):
+def prepare(config, database, addresses, replicas, *, priority_class=None):
+    priority_name = validate_priority_class(priority_class)
     if type(replicas) is not int or not 2 <= replicas <= 100:
         raise ValueError("Benchmark replicas must be between two and one hundred")
     if set(database) != {"jdbcUrl", "user", "password", "driver"}:
@@ -41,7 +42,7 @@ def prepare(config, database, addresses, replicas):
                         "policyTypes": ["Egress"], "egress": [{"to": [{"ipBlock": {"cidr": value}} for value in networks],
                                                                "ports": [{"protocol": "TCP", "port": uri.port or 5432}]}]}}
     deployment = {"spec": {"replicas": replicas, "template": {"spec": {
-        "preemptionPolicy": "Never",
+        "preemptionPolicy": "Never", "priorityClassName": priority_name,
         "volumes": [{"name": "database-ca", "configMap": {"name": "benchmark-database-ca"}}],
         "containers": [{"name": "gateway", "volumeMounts": [{"name": "database-ca", "mountPath": "/etc/database-ca", "readOnly": True}]}]}}}}
     quota = {"spec": {"hard": {"requests.cpu": "60", "limits.cpu": "60", "requests.memory": "140Gi",

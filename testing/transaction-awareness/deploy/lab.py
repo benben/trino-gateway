@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 
-from render import TASK, password_hash, render, validate_extra_fixtures
+from render import TASK, password_hash, render, validate_extra_fixtures, validate_priority_class
 from tls import generate_tls
 from transaction_config import configure_transactions
 from load_config import prepare as prepare_load
@@ -56,6 +56,7 @@ def main():
     create.add_argument("--extra-fixture", action="append", default=[])
     create.add_argument("--gateway-image", default="trinodb/trino-gateway:21", help="Gateway image; use a verified digest for reproducible comparisons")
     create.add_argument("--benchmark", action="store_true", help="Give controlled backends 1 CPU/512Mi and prohibit pod preemption")
+    create.add_argument("--priority-class", help="Existing task-owned, negative-priority, non-default, non-preempting class; required for benchmark")
     commands.add_parser("status")
     forward = commands.add_parser("forward", help="Keep loopback forwards running; stop with Ctrl-C")
     forward.add_argument("--base-port", type=int, default=18081)
@@ -75,6 +76,7 @@ def main():
     load.add_argument("--database-address", action="append", required=True)
     load.add_argument("--replicas", type=int, required=True)
     load.add_argument("--capacity-reviewed", action="store_true", help="Confirm node, memory, IP, and quota headroom before applying")
+    load.add_argument("--priority-class", required=True, help="Existing task-owned non-preempting PriorityClass")
     delete = commands.add_parser("delete", help="Delete this disposable namespace and all its test data")
     delete.add_argument("--confirm-namespace", required=True)
     args = parser.parse_args()
@@ -99,6 +101,11 @@ def main():
                       and (artifact_upload is None or pod["metadata"].get("annotations", {}).get("transaction-test/artifact-upload") == artifact_upload))
 
     if args.command == "create":
+        priority_class = None
+        if args.priority_class:
+            priority_class = json.loads(kubectl("get", "priorityclass", args.priority_class, "-o", "json", capture=True).stdout)
+        if args.benchmark or priority_class is not None:
+            validate_priority_class(priority_class)
         existing = kubectl("get", "namespace", args.namespace, "-o", "name", capture=True, check=False)
         if existing.returncode == 0:
             raise SystemExit("Refusing to recreate an existing namespace or replace its credentials")
@@ -116,7 +123,7 @@ def main():
         with os.fdopen(descriptor, "w") as output:
             output.write("TX_TRINO_USER=user\nTX_TRINO_PASSWORD=" + shlex.quote(trino_password) + "\n")
         resources = render(args.namespace, password, source, tls_files=tls_files, proxy_source=args.proxy_source.read_text(), trino_password_hash=hashed,
-                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture, gateway_image=args.gateway_image, benchmark=args.benchmark)
+                           include_real_trino=not args.without_real_trino, extra_fixtures=args.extra_fixture, gateway_image=args.gateway_image, benchmark=args.benchmark, priority_class=priority_class)
         for name, data in [("namespace.json", resources["items"][0]), ("resources.json", resources)]:
             target = runtime / name
             with target.open("x") as output:
@@ -163,12 +170,14 @@ def main():
     elif args.command == "configure-load":
         if not args.capacity_reviewed:
             raise SystemExit("Review eligible node, memory, pod-IP, and quota capacity before configuring benchmark scale")
+        priority_class = json.loads(kubectl("get", "priorityclass", args.priority_class, "-o", "json", capture=True).stdout)
+        validate_priority_class(priority_class)
         result = kubectl("-n", args.namespace, "get", "secret", "gateway-config", "-o", "json", capture=True)
         secret = json.loads(result.stdout)
         if secret["metadata"].get("labels", {}).get("task") != TASK:
             raise SystemExit("Refusing an unowned Gateway configuration")
         config = json.loads(base64.b64decode(secret["data"]["config.yaml"]))
-        updated, network, deployment, quota = prepare_load(config, json.loads(args.database_config.read_text()), args.database_address, args.replicas)
+        updated, network, deployment, quota = prepare_load(config, json.loads(args.database_config.read_text()), args.database_address, args.replicas, priority_class=priority_class)
         certificate = args.database_ca.read_text()
         if "-----BEGIN CERTIFICATE-----" not in certificate or "PRIVATE KEY" in certificate:
             raise SystemExit("Expected a public CA certificate bundle, never a private key")

@@ -28,7 +28,22 @@ def validate_extra_fixtures(names):
         raise ValueError("Extra fixture names must be unique DNS labels other than blue or green")
 
 
-def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=(), gateway_image="trinodb/trino-gateway:21", benchmark=False):
+def validate_priority_class(priority_class):
+    if not isinstance(priority_class, dict):
+        raise ValueError("Provide an explicitly approved, existing non-preempting PriorityClass")
+    metadata = priority_class.get("metadata", {})
+    name = metadata.get("name", "")
+    if (not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", name)
+            or metadata.get("labels", {}).get("task") != TASK
+            or type(priority_class.get("value")) is not int or priority_class["value"] >= 0
+            or priority_class.get("preemptionPolicy") != "Never"
+            or priority_class.get("globalDefault", False) is not False):
+        raise ValueError("PriorityClass must be task-owned, negative-priority, non-default, and non-preempting")
+    return name
+
+
+def render(namespace, password, fake_source=None, *, tls_files=None, proxy_source=None, trino_password_hash="!", include_real_trino=True, extra_fixtures=(), gateway_image="trinodb/trino-gateway:21", benchmark=False, priority_class=None):
+    priority_name = validate_priority_class(priority_class) if benchmark or priority_class is not None else None
     validate_extra_fixtures(extra_fixtures)
     if extra_fixtures and not fake_source:
         raise ValueError("Extra fixtures require the controlled backend source")
@@ -163,10 +178,11 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
                 item["data"]["config.properties"] += ("http-server.https.enabled=true\nhttp-server.https.port=8443\n"
                                                         f"http-server.https.keystore.path=/etc/lab-tls/{name}.p12\n"
                                                         "http-server.https.keystore.key=${ENV:TLS_STORE_PASSWORD}\n")
-    if benchmark:
+    if priority_name:
         for item in objects:
             if item["kind"] == "Deployment":
                 item["spec"]["template"]["spec"]["preemptionPolicy"] = "Never"
+                item["spec"]["template"]["spec"]["priorityClassName"] = priority_name
     return {"apiVersion": "v1", "kind": "List", "items": objects}
 
 
