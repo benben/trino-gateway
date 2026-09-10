@@ -2,12 +2,35 @@
 
 import threading
 import unittest
+from unittest.mock import patch
+import uuid
 
 from fake_trino import make_server
 from protocol import finish, request, statement
 
 
 class FakeTrinoTests(unittest.TestCase):
+    def test_query_ids_do_not_collide_when_random_values_repeat(self):
+        with patch("fake_trino.uuid.uuid4", return_value=uuid.UUID(int=1)):
+            first = statement(self.url, "SELECT 1")
+            second = statement(self.url, "SELECT 1")
+        self.assertNotEqual(first.json()["id"], second.json()["id"])
+        self.assertEqual(len(self.server.state.queries), 2)
+        for response in (first, second):
+            self.assertEqual(finish(response, self.url)[-1].json()["id"], response.json()["id"])
+
+    def test_query_sequence_resets_only_with_new_incarnation(self):
+        first = statement(self.url, "SELECT 1").json()["id"]
+        request(self.url + "/__test/config", "POST", '{"lowercase_headers": true}')
+        second = statement(self.url, "SELECT 1").json()["id"]
+        self.assertEqual(int(second.split("_")[2]), int(first.split("_")[2]) + 1)
+        different_prefix = "0" if first.split("_")[3][0] != "0" else "1"
+        with patch("fake_trino.uuid.uuid4", return_value=uuid.UUID(hex=different_prefix + "0" * 31)):
+            request(self.url + "/__test/restart", "POST", "{}")
+        restarted = statement(self.url, "SELECT 1").json()["id"]
+        self.assertEqual(int(restarted.split("_")[2]), 1)
+        self.assertNotEqual(first.split("_")[3], restarted.split("_")[3])
+
     def test_duplicate_next_uri_contains_two_conflicting_raw_fields(self):
         request(self.url + "/__test/config", "POST", '{"duplicate_next_uri": true}')
         initial = statement(self.url, "SELECT 1")

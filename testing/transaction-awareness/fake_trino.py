@@ -23,6 +23,7 @@ class State:
         with self.lock:
             self.node_id = str(uuid.uuid4())
             self.coordinator_id = uuid.uuid4().hex[:5]
+            self.query_sequence = 0
             self.transactions = {}
             self.queries = {}
             self.partial_cancel_paths = {}
@@ -191,7 +192,8 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             transaction = supplied[0] if supplied else "NONE"
             with state.lock:
                 config = dict(state.config)
-                query_id = "20260101_000000_" + str(uuid.uuid4().int % 100000000) + "_" + state.coordinator_id
+                state.query_sequence += 1
+                query_id = "20260101_000000_" + str(state.query_sequence) + "_" + state.coordinator_id
                 result = {"id": query_id, "infoUri": self.base() + "/ui/query.html?" + query_id,
                           "stats": {"state": "FINISHED", "queued": False,
                                     "scheduled": True, "nodes": 1, "totalSplits": 1,
