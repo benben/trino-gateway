@@ -36,12 +36,12 @@ jobs:
           cache: maven
       - name: PostgreSQL transaction ledger and protocol adapter
         env:
-          TX_STORE_TEST_JDBC_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+          TX_STORE_TEST_JDBC_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
           TX_STORE_TEST_USERNAME: postgres
         run: >-
           ./mvnw -B -ntp -pl gateway-ha -am test
           -Dskip.installnodepnpm -Dskip.pnpm
-          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler'
+          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler,TestDatabaseDeadline,TestJdbcConnectionManager'
           -Dsurefire.failIfNoSpecifiedTests=false
       - name: Protocol and network fault fixture self-tests
         working-directory: testing/transaction-awareness

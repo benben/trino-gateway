@@ -84,6 +84,8 @@ for completion work; other background database work can also use that space.
 Configure deadlines through these fields, not JDBC URL overrides. TLS settings
 remain in the JDBC URL. A bounded pool protects connection count, but does not
 remove contention on a hot backend's existing exclusive row lock.
+Statement and lock timeouts constrain Gateway metadata SQL, not the duration of
+Trino queries or transactions.
 
 The V8 migration adds partial indexes for pending admissions, running queries and
 retained terminal queries. It does not delete history or expire uncertain work.
