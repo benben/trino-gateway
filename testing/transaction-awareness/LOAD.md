@@ -77,6 +77,14 @@ They generate synthetic query credentials inside the process and print metrics
 for private capture. Fake backends do not authenticate these credentials; the
 separate real-Trino suites establish authentication and client compatibility.
 
+The checkpoint protocol client also supports `TX_TLS_SERVER_NAME` through the
+same verified connection class. This lets each pod IP retain the expected
+certificate identity without routing through a Service. Certificate-chain and
+hostname verification remain enabled; an incorrect name or untrusted CA fails
+before HTTP dispatch. Without this setting, the URL hostname is verified.
+Bundle `load_open_loop.py` alongside `protocol.py` and `load_checkpoints.py`
+when running checkpoints inside the disposable client Job.
+
 `load_checkpoints.Checkpoints` holds a transaction during measurement. Afterwards
 it proves that transaction blocks sealing, switches the group, checks existing
 transaction and new-query placement through every Gateway, rolls back, and

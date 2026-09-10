@@ -7,6 +7,8 @@ import ssl
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
+from load_open_loop import VerifiedNameConnection
+
 
 @dataclass
 class Response:
@@ -25,7 +27,8 @@ def request(url, method="GET", body=None, headers=(), timeout=40):
     parsed = urlsplit(url)
     if parsed.scheme == "https":
         context = ssl.create_default_context(cafile=os.environ.get("TX_CA_FILE"))
-        connection = http.client.HTTPSConnection(parsed.hostname, parsed.port, timeout=timeout, context=context)
+        connection = VerifiedNameConnection(parsed.hostname, parsed.port, timeout=timeout, context=context,
+                                            server_name=os.environ.get("TX_TLS_SERVER_NAME"))
     elif parsed.scheme == "http":
         connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     else:
