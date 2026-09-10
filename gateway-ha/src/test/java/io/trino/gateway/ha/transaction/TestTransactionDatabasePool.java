@@ -44,8 +44,13 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 import org.weakref.jmx.guice.MBeanModule;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static io.trino.gateway.ha.config.ClusterStatsMonitorType.NOOP;
@@ -315,9 +320,9 @@ class TestTransactionDatabasePool
             try {
                 Jdbi pooled = injector.getInstance(Jdbi.class);
                 if (check.equals("reuse")) {
-                    long first = pooled.withHandle(handle -> handle.createQuery("SELECT pg_backend_pid()").mapTo(Long.class).one());
-                    long second = pooled.withHandle(handle -> handle.createQuery("SELECT pg_backend_pid()").mapTo(Long.class).one());
-                    assertThat(second).isEqualTo(first);
+                    List<Long> backendPids = borrowWithBackgroundActivity(pooled);
+                    assertThat(backendPids).hasSize(24);
+                    assertThat(backendPids.stream().distinct().count()).isBetween(2L, 4L);
                 }
                 if (check.equals("settings")) {
                     String statementTimeout = pooled.withHandle(handle -> handle.createQuery("SHOW statement_timeout").mapTo(String.class).one());
@@ -372,5 +377,48 @@ class TestTransactionDatabasePool
         finally {
             admin.useHandle(handle -> handle.execute("DROP SCHEMA " + schema + " CASCADE"));
         }
+    }
+
+    @Test
+    void backgroundBorrowFixtureDetectsUnpooledConnections()
+            throws Exception
+    {
+        List<Long> backendPids = borrowWithBackgroundActivity(admin);
+        assertThat(backendPids).hasSize(24);
+        assertThat(backendPids.stream().distinct().count()).isGreaterThan(4);
+    }
+
+    private static List<Long> borrowWithBackgroundActivity(Jdbi database)
+            throws Exception
+    {
+        List<Long> backendPids = new ArrayList<>();
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            for (int round = 0; round < 12; round++) {
+                CompletableFuture<Long> backgroundPid = new CompletableFuture<>();
+                CountDownLatch release = new CountDownLatch(1);
+                var background = executor.submit(() -> {
+                    try (var handle = database.open()) {
+                        backgroundPid.complete(handle.createQuery("SELECT pg_backend_pid()").mapTo(Long.class).one());
+                        assertThat(release.await(10, TimeUnit.SECONDS)).isTrue();
+                    }
+                    catch (Exception failure) {
+                        backgroundPid.completeExceptionally(failure);
+                        throw new RuntimeException(failure);
+                    }
+                });
+                try {
+                    long heldPid = backgroundPid.get(5, TimeUnit.SECONDS);
+                    long foregroundPid = database.withHandle(handle -> handle.createQuery("SELECT pg_backend_pid()").mapTo(Long.class).one());
+                    assertThat(foregroundPid).isNotEqualTo(heldPid);
+                    backendPids.add(heldPid);
+                    backendPids.add(foregroundPid);
+                }
+                finally {
+                    release.countDown();
+                    background.get(5, TimeUnit.SECONDS);
+                }
+            }
+        }
+        return backendPids;
     }
 }
