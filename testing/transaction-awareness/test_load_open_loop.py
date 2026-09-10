@@ -27,14 +27,14 @@ class Transport:
 
 class OpenLoopTests(unittest.TestCase):
     def deterministic_load(self, *, duration=2.5, rate=2, delays=None, statuses=None,
-                           measurement_start_utc=None, sleep_overrun=0):
+                           measurement_start_utc=None, sleep_overrun=0, executor_setup_delay=0):
         clock = [100.0]
         delays = iter(delays or [])
         statuses = iter(statuses or [])
 
         class InlineExecutor:
             def __init__(self, **kwargs):
-                pass
+                clock[0] += executor_setup_delay
 
             def __enter__(self):
                 return self
@@ -56,11 +56,23 @@ class OpenLoopTests(unittest.TestCase):
             clock[0] += seconds + sleep_overrun
 
         with patch("load_open_loop.ThreadPoolExecutor", InlineExecutor), \
+                patch("load_open_loop.prepare_workers", create=True), \
                 patch("load_open_loop.time.monotonic", side_effect=lambda: clock[0]), \
                 patch("load_open_loop.time.sleep", side_effect=advance), \
                 patch("load_open_loop.time.time", side_effect=lambda: 1700000000 + clock[0] - 100):
             return self.run_load(ScriptedTransport(), duration=duration, rate=rate,
                                  measurement_start_utc=measurement_start_utc)
+
+    def test_executor_setup_does_not_consume_the_arrival_window(self):
+        result = self.deterministic_load(executor_setup_delay=1.5)
+        self.assertEqual(result["counts"]["started"], 5)
+        self.assertEqual(result["client_dropped_requests"], 0)
+        self.assertEqual(result["window_start_utc"], "2023-11-14T22:13:21.500000Z")
+
+    def test_executor_setup_cannot_shift_a_missed_scheduled_boundary(self):
+        with self.assertRaisesRegex(ValueError, "missed"):
+            self.deterministic_load(executor_setup_delay=2,
+                                    measurement_start_utc="2023-11-14T22:13:20Z")
 
     def test_scheduled_measurement_waits_without_shifting_actual_window(self):
         result = self.deterministic_load(measurement_start_utc="2023-11-14T22:13:22Z")

@@ -35,6 +35,15 @@ p50/p95/p99, errors, scheduling lag, dropped arrivals, CPU time, and outstanding
 continuations. `503` responses are not successful target throughput. Client or
 fixture saturation invalidates a server-capacity conclusion.
 
+Before each warmup or measurement window, the client starts every configured
+executor worker using bounded, no-traffic barrier tasks. Worker preparation
+has a 30-second deadline and releases waiting workers on failure. It does not
+open connections or prewarm the Gateway, database, or backend. Receipts record
+`client_setup_seconds` and `client_setup_method` separately; request timing and
+the existing process-CPU interval exclude this setup. Scheduled-start checks
+still reject a boundary missed during preparation. All warmup error and client
+lag gates remain unchanged.
+
 `window_start_utc` and `window_end_utc` identify the scheduled measurement
 window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
 schedule; subsequent wall-clock adjustments do not change its end timestamp.

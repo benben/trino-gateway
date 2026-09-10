@@ -43,6 +43,40 @@ def invalid(result):
     return bool(result["errors"] or result["client_bottleneck_detected"] or result["unconsumed_continuations"])
 
 
+def prepare_workers(executor, count, timeout=30):
+    """Start bounded client workers without opening backend connections."""
+    if not 1 <= count <= 512 or not 0 < timeout <= 60:
+        raise ValueError("Worker preparation requires bounded capacity and timeout")
+    deadline = time.monotonic() + timeout
+    release = threading.Event()
+    condition = threading.Condition()
+    ready = 0
+    futures = []
+
+    def prepare():
+        nonlocal ready
+        with condition:
+            ready += 1
+            condition.notify_all()
+        release.wait(max(0, deadline - time.monotonic()))
+
+    try:
+        for _ in range(count):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Client worker preparation exceeded its deadline")
+            futures.append(executor.submit(prepare))
+        with condition:
+            complete = condition.wait_for(lambda: ready == count, timeout=max(0, deadline - time.monotonic()))
+        if not complete or time.monotonic() >= deadline:
+            raise TimeoutError("Client worker preparation exceeded its deadline")
+    finally:
+        release.set()
+    for future in futures:
+        future.result(timeout=max(0, deadline - time.monotonic()))
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Client worker preparation exceeded its deadline")
+
+
 class Connections:
     """Reuse verified connections without retrying potentially accepted requests."""
 
@@ -217,33 +251,36 @@ class OpenLoop:
 
     def run(self):
         permit = threading.BoundedSemaphore(self.concurrency)
-        if self.measurement_start is not None:
-            delay = self.measurement_start.timestamp() - time.time()
-            if delay > 600:
-                raise ValueError("Measurement start must be at most 600 seconds away after warmup")
-            if delay < -1:
-                raise ValueError("Scheduled measurement start was missed by more than one second")
-            if delay > 0:
-                time.sleep(delay)
-        beginning = time.monotonic()
-        window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
-        start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
-        if start_drift is not None and abs(start_drift) > 1:
-            raise ValueError("Scheduled measurement start was missed or the UTC clock changed")
-        cpu_beginning = time.process_time()
-        end = beginning + self.duration
-        self.window_beginning, self.window_end = beginning, end
-        planned = int(self.rate * self.duration)
-
-        def worker(sequence, scheduled):
-            try:
-                self.perform(sequence, scheduled, end)
-            finally:
-                with self.lock:
-                    self.inflight -= 1
-                permit.release()
-
+        setup_beginning = time.monotonic()
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            prepare_workers(executor, self.concurrency)
+            setup_elapsed = time.monotonic() - setup_beginning
+            if self.measurement_start is not None:
+                delay = self.measurement_start.timestamp() - time.time()
+                if delay > 600:
+                    raise ValueError("Measurement start must be at most 600 seconds away after warmup")
+                if delay < -1:
+                    raise ValueError("Scheduled measurement start was missed by more than one second")
+                if delay > 0:
+                    time.sleep(delay)
+            beginning = time.monotonic()
+            window_start_utc = datetime.fromtimestamp(time.time(), timezone.utc)
+            start_drift = None if self.measurement_start is None else (window_start_utc - self.measurement_start).total_seconds()
+            if start_drift is not None and abs(start_drift) > 1:
+                raise ValueError("Scheduled measurement start was missed or the UTC clock changed")
+            cpu_beginning = time.process_time()
+            end = beginning + self.duration
+            self.window_beginning, self.window_end = beginning, end
+            planned = int(self.rate * self.duration)
+
+            def worker(sequence, scheduled):
+                try:
+                    self.perform(sequence, scheduled, end)
+                finally:
+                    with self.lock:
+                        self.inflight -= 1
+                    permit.release()
+
             for sequence in range(planned):
                 scheduled = beginning + sequence / self.rate
                 delay = scheduled - time.monotonic()
@@ -278,6 +315,8 @@ class OpenLoop:
             request_rates[event] = dict(min=min(rates), max=max(rates),
                                         avg=sum(bucket[event] for bucket in self.second_buckets) / self.duration)
         return {"scheduled_http_requests": planned, "target_http_rps": self.rate,
+                "client_setup_seconds": setup_elapsed,
+                "client_setup_method": "all executor workers started before the window; no backend traffic",
                 "window_start_utc": window_start_utc.isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "window_end_utc": (window_start_utc + timedelta(seconds=self.duration)).isoformat(timespec="microseconds").replace("+00:00", "Z"),
                 "planned_window_start_utc": None if self.measurement_start is None else self.measurement_start.isoformat(timespec="microseconds").replace("+00:00", "Z"),
