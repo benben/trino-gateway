@@ -16,6 +16,16 @@ import time
 from urllib.parse import urlsplit
 
 
+RESPONSE_503_CATEGORIES = {
+    b"Transaction-aware request capacity is unavailable; no backend request was dispatched": "request_capacity",
+    b"Transaction routing state is unavailable; the request was not reassigned": "routing_state_unavailable",
+    b"Transaction routing state rejected the operation: NOT_ACTIVE": "backend_not_active",
+    b"No backend belongs to the selected routing group": "no_backend_for_group",
+    b"Backend must expose a ready Trino coordinator process identity": "process_identity_not_ready",
+    b"Backend process identity is unavailable": "process_identity_unavailable",
+}
+
+
 def percentile(values, fraction):
     if not values:
         return None
@@ -115,6 +125,7 @@ class OpenLoop:
         self.lock = threading.Lock()
         self.counts = Counter()
         self.statuses, self.errors, self.backend_rows = Counter(), Counter(), Counter()
+        self.response_error_categories = {"measured": Counter(), "cleanup": Counter()}
         self.gateway_counts = [Counter() for _ in gateways]
         self.method_counts = Counter()
         self.latencies, self.corrected_latencies, self.lags = [], [], []
@@ -158,7 +169,7 @@ class OpenLoop:
         with self.lock:
             index = (self.method_counts[method] + (1 if method == "GET" else 0)) % len(self.gateways)
             self.method_counts[method] += 1
-        status, payload, error = None, None, None
+        status, payload, error, response_category = None, None, None, None
         try:
             status, raw = self.transport.request(index, method, path, body, headers)
             if status == 200:
@@ -169,6 +180,8 @@ class OpenLoop:
                     error = "wrong_backend_result"
             else:
                 error = "http_" + str(status)
+                if status == 503:
+                    response_category = RESPONSE_503_CATEGORIES.get(raw, "unknown_503") if len(raw) <= 256 else "unknown_503"
         except Exception as failure:
             error = type(failure).__name__
         finished = time.monotonic()
@@ -181,6 +194,8 @@ class OpenLoop:
                 self.statuses[str(status)] += 1
             if error:
                 self.errors[error] += 1
+            if response_category:
+                self.response_error_categories["cleanup" if cleanup else "measured"][response_category] += 1
             if not cleanup:
                 self.latencies.append((finished - started) * 1000)
                 self.corrected_latencies.append((finished - scheduled) * 1000)
@@ -273,6 +288,7 @@ class OpenLoop:
                 "achieved_http_rps": counts.get("completed_in_window", 0) / self.duration,
                 "successful_http_rps": counts.get("successful_in_window", 0) / self.duration,
                 "counts": counts, "http_statuses": dict(self.statuses), "errors": dict(self.errors),
+                "response_error_categories": {phase: dict(counts) for phase, counts in self.response_error_categories.items()},
                 "latency_ms": distribution(self.latencies), "scheduled_latency_ms": distribution(self.corrected_latencies),
                 "client_lag_ms": distribution(self.lags), "client_dropped_requests": dropped,
                 "client_bottleneck_detected": dropped > 0 or (percentile(self.lags, .99) or 0) > 5,

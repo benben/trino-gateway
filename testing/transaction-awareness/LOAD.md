@@ -38,6 +38,17 @@ fixture saturation invalidates a server-capacity conclusion.
 `window_start_utc` and `window_end_utc` identify the scheduled measurement
 window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
 schedule; subsequent wall-clock adjustments do not change its end timestamp.
+
+`response_error_categories` separates measured-request and cleanup counts for
+six exact plain-text Gateway `503` messages. It emits fixed category names,
+never response bodies. Unrecognized, wrapped, or modified messages remain
+`unknown_503`; matching a message does not authenticate its origin. In particular,
+`routing_state_unavailable` does not distinguish pool exhaustion, database
+connectivity, lock timeouts, or other internal failures. Existing HTTP status,
+error, retry, and validity behavior is unchanged. These request-phase counters
+can include responses completed after the measurement window; use the existing
+per-second telemetry for in-window rates.
+
 Warmup has a separate nested receipt. Cleanup traffic and requests completed
 after the window do not enter its `second_buckets` or `request_rates`.
 Existing overall error counts still include cleanup failures and invalidate
