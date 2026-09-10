@@ -99,6 +99,13 @@ multiple labs' uploads concurrently when the connection is already saturated.
 Use this destructive lab operation only between test runs, not as a model of a
 production rolling deployment.
 
+For the all-Gateway restart contract, `restart_gateways.py --running-image`
+replaces every Gateway process with its current digest-pinned image. It rejects
+floating image tags and local uploaded-JAR commands. It verifies new pod UIDs,
+the unchanged image/command, and unchanged database, Trino, and Secret snapshots.
+The existing `--jar` alternative remains available. Run this disruptive contract
+only after the other suites finish; reopen external forwards afterwards.
+
 The real Trino services are `https://trino-blue:8443` and
 `https://trino-green:8443`. Register them with separate backend names and routing
 groups from the Python fixtures. Trino processes forwarded headers so result

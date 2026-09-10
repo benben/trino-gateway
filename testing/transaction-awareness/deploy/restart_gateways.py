@@ -28,6 +28,16 @@ def verify_replacement(before, after):
         raise AssertionError("PostgreSQL or a Trino process changed during the restart")
     if before["secrets"] != after["secrets"]:
         raise AssertionError("Persistent lab credentials or configuration changed during the restart")
+    if before.get("image_config") != after.get("image_config"):
+        raise AssertionError("Gateway image or launch command changed during the restart")
+
+
+def validate_running_image(image, command, arguments):
+    if not re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", image):
+        raise ValueError("Running-image restart requires an exact image digest")
+    if command != ["sh", "-c"] or len(arguments) != 1 or not re.fullmatch(
+            r"exec java -Xmx[0-9]+[mMgG] -jar /usr/lib/trino-gateway/gateway-ha-jar-with-dependencies\.jar /etc/trino-gateway/config\.yaml", arguments[0]):
+        raise ValueError("Running-image restart requires the standard in-image lab JAR command")
 
 
 def main():
@@ -35,7 +45,9 @@ def main():
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--confirm-restart", required=True)
-    parser.add_argument("--jar", required=True, type=Path)
+    artifact = parser.add_mutually_exclusive_group(required=True)
+    artifact.add_argument("--jar", type=Path)
+    artifact.add_argument("--running-image", action="store_true", help="Restart the same digest-pinned image without uploading a local JAR")
     parser.add_argument("--base-port", type=int, default=19081)
     args = parser.parse_args()
     validate_scope(args.context, args.namespace, args.confirm_restart)
@@ -44,8 +56,8 @@ def main():
     for key in ["TX_CA_FILE", "TX_TRINO_USER", "TX_TRINO_PASSWORD", "TX_ADMIN_TOKEN"]:
         if not os.environ.get(key):
             raise ValueError("Missing runtime configuration: " + key)
-    jar = args.jar.resolve(strict=True)
-    if not jar.is_file() or jar.suffix != ".jar":
+    jar = args.jar.resolve(strict=True) if args.jar else None
+    if jar is not None and (not jar.is_file() or jar.suffix != ".jar"):
         raise ValueError("A locally built shaded Gateway JAR is required")
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from protocol import finish, request, statement
@@ -64,6 +76,10 @@ def main():
         deployment = read("get", "deployment", "gateway", "-o", "json")
         if deployment["metadata"].get("labels", {}).get("task") != TASK:
             raise AssertionError("The Gateway Deployment does not belong to this fixture")
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        image_config = {key: container.get(key) for key in ["image", "command", "args"]}
+        if args.running_image:
+            validate_running_image(container["image"], container.get("command", []), container.get("args", []))
         pods = read("get", "pods", "-l", "task=" + TASK, "-o", "json")["items"]
         selected = {}
         gateway_pods = []
@@ -75,6 +91,9 @@ def main():
             if not statuses or not all(status.get("ready") for status in statuses):
                 raise AssertionError("A required lab process is not ready")
             if app == "gateway":
+                running = pod["spec"]["containers"][0]
+                if args.running_image and {key: running.get(key) for key in ["image", "command", "args"]} != image_config:
+                    raise AssertionError("A Gateway pod does not use the selected digest and launch command")
                 gateway_pods.append(pod)
             else:
                 if app in selected:
@@ -93,6 +112,7 @@ def main():
         gateway_pods.sort(key=lambda pod: pod["metadata"]["name"])
         return {"gateways": {pod["metadata"]["uid"] for pod in gateway_pods}, "dependencies": selected,
                 "secrets": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                "image_config": image_config if args.running_image else None,
                 "pods": [pod["metadata"]["name"] for pod in gateway_pods]}
 
     processes = []
@@ -183,8 +203,11 @@ def main():
         pending_query_id = pending_result.json()["id"]
         close_forwards()
         print("Real transaction is open; replacing all Gateway processes while preserving its private identity.")
-        subprocess.run([sys.executable, str(Path(__file__).with_name("lab.py")), "--context", args.context, "--namespace", args.namespace,
-                        "artifact", "--jar", str(jar)], check=True, timeout=900)
+        if args.running_image:
+            subprocess.run(base + ["rollout", "restart", "deployment/gateway"], check=True, timeout=60)
+        else:
+            subprocess.run([sys.executable, str(Path(__file__).with_name("lab.py")), "--context", args.context, "--namespace", args.namespace,
+                            "artifact", "--jar", str(jar)], check=True, timeout=900)
         deadline = time.monotonic() + 180
         while True:
             try:
