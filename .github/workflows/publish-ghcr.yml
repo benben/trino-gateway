@@ -82,11 +82,7 @@ jobs:
           staging="${image}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           reference="${image}:sha-${GITHUB_SHA}"
           crane index append "${manifests[@]}" -t "$staging"
-          crane mutate "$staging" -t "$reference" \
-            --annotation "org.opencontainers.image.source=${source_url}" \
-            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation 'org.opencontainers.image.description=Transaction-aware Trino Gateway fork' \
-            --annotation 'org.opencontainers.image.licenses=Apache-2.0'
+          crane tag "$staging" "sha-${GITHUB_SHA}"
           digest=$(crane digest "$reference")
           crane manifest "${image}@${digest}" | jq -e \
             '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
@@ -104,5 +100,5 @@ jobs:
           {
             printf 'Published `%s`\n\n' "$reference"
             printf 'Pin deployments to `%s@%s`.\n\n' "$image" "$digest"
-            printf 'The package owner must make the package public after its first publication.\n'
+            printf 'If the package is private, its owner must make it public before anonymous pulls.\n'
           } >> "$GITHUB_STEP_SUMMARY"
