@@ -82,6 +82,20 @@ The live deadline regression passed on the published image with the same 500 ms
 routing budget used for its baseline failure. Full Kubernetes protocol, native
 JDBC, restart and load reruns are not yet complete at this checkpoint.
 
+### Live gate failure under investigation
+
+The published `2adce62` candidate is not accepted for transaction-aware use.
+Two independent labs exhausted their per-process request capacity during ordinary
+sequential requests, before fault injection. The fault lab reported zero pending
+requests, open transactions and active queries while new requests received 503.
+This is leaked process capacity, not a legitimate durable admission backlog.
+
+The overload/normal runner stopped during overload setup, before its normal
+contract cases. The fault runner passed four capability cases and then stopped
+during the next case's setup. These are failed acceptance runs, not passing suites.
+Their ledger state is preserved. A regression for servlet-request recycling and
+asynchronous completion is being developed before the complete live rerun.
+
 ## Interpretation limits
 
 Pool and request limits are per process. They bound particular resources, not
