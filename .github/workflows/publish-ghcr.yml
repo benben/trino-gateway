@@ -1,0 +1,108 @@
+name: Publish GHCR image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ghcr-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -Eeuo pipefail {0}
+
+jobs:
+  publish:
+    if: github.repository == 'benben/trino-gateway' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.0.0
+        with:
+          java-version: 25
+          distribution: temurin
+          cache: maven
+
+      - name: Build application
+        run: ./mvnw -B -ntp install -DskipTests -Dmaven.source.skip=true -Dair.check.skip-all
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.2.0
+        with:
+          platforms: amd64,arm64
+
+      - name: Build and test both architectures
+        env:
+          TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
+          TRINO_GATEWAY_IMAGE_REVISION: ${{ github.sha }}
+        run: docker/build.sh
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.7
+        with:
+          version: v0.22.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and verify image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image=ghcr.io/benben/trino-gateway
+          source_url="https://github.com/${GITHUB_REPOSITORY}"
+          version=$(<trino-gateway-version.txt)
+          publish_tmp=$(mktemp -d)
+          manifests=()
+          for arch in amd64 arm64; do
+            docker save "trino-gateway:${version}-${arch}" -o "${publish_tmp}/${arch}.tar"
+            arch_digest=$(crane digest --tarball "${publish_tmp}/${arch}.tar")
+            crane push "${publish_tmp}/${arch}.tar" "${image}@${arch_digest}" --image-refs "${publish_tmp}/${arch}.ref"
+            manifests+=(-m "$(<"${publish_tmp}/${arch}.ref")")
+          done
+
+          staging="${image}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          reference="${image}:sha-${GITHUB_SHA}"
+          crane index append "${manifests[@]}" -t "$staging"
+          crane mutate "$staging" -t "$reference" \
+            --annotation "org.opencontainers.image.source=${source_url}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation 'org.opencontainers.image.description=Transaction-aware Trino Gateway fork' \
+            --annotation 'org.opencontainers.image.licenses=Apache-2.0'
+          digest=$(crane digest "$reference")
+          crane manifest "${image}@${digest}" | jq -e \
+            '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+          for arch in amd64 arm64; do
+            crane config --platform "linux/${arch}" "${image}@${digest}" | jq -e \
+              --arg source "$source_url" --arg revision "$GITHUB_SHA" \
+              '.config.Labels["org.opencontainers.image.source"] == $source and .config.Labels["org.opencontainers.image.revision"] == $revision'
+          done
+
+          current_main=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$current_main" == "$GITHUB_SHA" ]]; then
+            crane tag "${image}@${digest}" main
+            crane tag "${image}@${digest}" latest
+          fi
+          {
+            printf 'Published `%s`\n\n' "$reference"
+            printf 'Pin deployments to `%s@%s`.\n\n' "$image" "$digest"
+            printf 'The package owner must make the package public after its first publication.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

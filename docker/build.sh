@@ -107,11 +107,19 @@ echo "${TRINO_GATEWAY_VERSION}" > "${SOURCE_DIR}"/trino-gateway-version.txt
 TRINO_GATEWAY_BASE_IMAGE=${TRINO_GATEWAY_BASE_IMAGE:-'redhat/ubi10-micro:latest'}
 TRINO_GATEWAY_BUILD_IMAGE=${TRINO_GATEWAY_BUILD_IMAGE:-'redhat/ubi10:latest'}
 
+IMAGE_LABEL_ARGS=()
+if [[ -n "${TRINO_GATEWAY_IMAGE_SOURCE:-}" ]]; then
+    IMAGE_LABEL_ARGS+=(--label "org.opencontainers.image.source=${TRINO_GATEWAY_IMAGE_SOURCE}")
+    IMAGE_LABEL_ARGS+=(--label "org.opencontainers.image.revision=${TRINO_GATEWAY_IMAGE_REVISION:?Image revision is required}")
+    IMAGE_LABEL_ARGS+=(--label "org.opencontainers.image.licenses=Apache-2.0")
+fi
+
 for arch in "${ARCHITECTURES[@]}"; do
     echo "🫙  Building the image for $arch with Temurin JDK release ${JDK_RELEASE_NAME}"
     DOCKER_BUILDKIT=1 \
     docker build \
         "${WORK_DIR}" \
+        ${IMAGE_LABEL_ARGS[@]+"${IMAGE_LABEL_ARGS[@]}"} \
         --pull \
         --build-arg JDK_RELEASE_NAME="${JDK_RELEASE_NAME}" \
         --build-arg JDK_DOWNLOAD_LINK="$(temurin_jdk_link "jdk-${JDK_RELEASE_NAME}" "${arch}")" \
