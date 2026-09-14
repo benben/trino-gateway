@@ -27,6 +27,11 @@ public interface RoutingGroupSelector
 {
     String ROUTING_GROUP_HEADER = "X-Trino-Routing-Group";
 
+    default boolean isAuthoritative()
+    {
+        return false;
+    }
+
     /**
      * Routing group selector that relies on the X-Trino-Routing-Group
      * header to determine the right routing group.

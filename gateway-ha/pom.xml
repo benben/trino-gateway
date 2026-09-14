@@ -370,6 +370,13 @@
         </dependency>
 
         <dependency>
+            <groupId>com.squareup.okio</groupId>
+            <artifactId>okio-jvm</artifactId>
+            <version>3.18.1</version>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
             <groupId>io.trino</groupId>
             <artifactId>trino-client</artifactId>
             <version>${dep.trino.version}</version>

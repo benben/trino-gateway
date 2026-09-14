@@ -308,6 +308,7 @@ public class HaGatewayConfiguration
     // setters in document order and checking inside a setter would depend on which field is set first.
     public void validate()
     {
+        routing.getPrincipalRouting().validate();
         transactionAwareness.validate(dataStore);
         if (clientCertificateJwtAuthentication == null) {
             // Nothing reads these without the bridge block, so accepting them would silently do nothing

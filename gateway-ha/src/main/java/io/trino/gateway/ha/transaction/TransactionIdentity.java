@@ -131,6 +131,10 @@ public final class TransactionIdentity
 
     public static WebApplicationException error(int status, String message)
     {
-        return new WebApplicationException(Response.status(status).type("text/plain").entity(message).build());
+        Response.ResponseBuilder response = Response.status(status).type("text/plain").entity(message);
+        if (status == 401) {
+            response.header("WWW-Authenticate", "Basic realm=\"Trino\"");
+        }
+        return new WebApplicationException(response.build());
     }
 }

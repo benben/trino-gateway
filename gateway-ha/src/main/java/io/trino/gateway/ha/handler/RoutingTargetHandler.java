@@ -40,6 +40,7 @@ import static com.google.common.base.Strings.isNullOrEmpty;
 import static io.trino.gateway.ha.handler.HttpUtils.USER_HEADER;
 import static io.trino.gateway.ha.handler.ProxyUtils.buildUriWithNewCluster;
 import static io.trino.gateway.ha.handler.ProxyUtils.extractQueryIdIfPresent;
+import static io.trino.gateway.ha.transaction.TransactionIdentity.error;
 import static java.util.Objects.requireNonNull;
 
 public class RoutingTargetHandler
@@ -87,6 +88,9 @@ public class RoutingTargetHandler
     {
         Optional<String> queryId = extractQueryIdIfPresent(request, statementPaths, requestAnalyserClientsUseV2Format, requestAnalyserMaxBodySize);
         Optional<String> previousCluster = getPreviousCluster(queryId, request);
+        if (routingGroupSelector.isAuthoritative() && queryId.isPresent() && previousCluster.isEmpty()) {
+            throw error(404, "Unknown query identifier");
+        }
 
         RoutingTargetResponse routingTargetResponse = previousCluster.map(cluster -> {
             String routingGroup = queryId.map(routingManager::findRoutingGroupForQueryId)
@@ -116,7 +120,19 @@ public class RoutingTargetHandler
         String routingGroup = !isNullOrEmpty(routingDestination.routingGroup())
                 ? routingDestination.routingGroup()
                 : defaultRoutingGroup;
-        ProxyBackendConfiguration backendConfiguration = routingManager.provideBackendConfiguration(routingGroup, user);
+        ProxyBackendConfiguration backendConfiguration;
+        try {
+            backendConfiguration = routingManager.provideBackendConfiguration(routingGroup, user);
+        }
+        catch (IllegalStateException failure) {
+            if (routingGroupSelector.isAuthoritative()) {
+                throw error(503, "No healthy backend belongs to the assigned routing group");
+            }
+            throw failure;
+        }
+        if (routingGroupSelector.isAuthoritative() && !routingGroup.equals(backendConfiguration.getRoutingGroup())) {
+            throw error(503, "No healthy backend belongs to the assigned routing group");
+        }
         String clusterHost = backendConfiguration.getProxyTo();
         String externalUrl = backendConfiguration.getExternalUrl();
         // Apply headers from RoutingDestination if there are any
@@ -177,6 +193,9 @@ public class RoutingTargetHandler
     {
         if (queryId.isPresent()) {
             return queryId.map(routingManager::findBackendForQueryId);
+        }
+        if (routingGroupSelector.isAuthoritative()) {
+            return Optional.empty();
         }
         if (cookiesEnabled && request.getCookies() != null) {
             List<GatewayCookie> cookies = Arrays.stream(request.getCookies())

@@ -1,5 +1,8 @@
 # Trino Gateway
 
+Optional [principal-based routing](docs/principal-routing.md) lets a control plane
+assign warehouses to routing groups without customer-supplied routing headers.
+
 A load balancer, proxy server, and configurable routing gateway for multiple
 [Trino](https://trino.io) clusters.
 

@@ -51,6 +51,7 @@ import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.HaGatewayManager;
 import io.trino.gateway.ha.router.HaQueryHistoryManager;
 import io.trino.gateway.ha.router.PathFilter;
+import io.trino.gateway.ha.router.PrincipalRoutingGroupSelector;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.security.AuthorizationManager;
@@ -174,6 +175,9 @@ public class HaGatewayProviderModule
     @Singleton
     public static RoutingGroupSelector getRoutingGroupSelector(@ForRouter HttpClient httpClient, HaGatewayConfiguration configuration)
     {
+        if (configuration.getRouting().getPrincipalRouting().isEnabled()) {
+            return new PrincipalRoutingGroupSelector(httpClient, configuration.getRouting().getPrincipalRouting());
+        }
         RoutingRulesConfiguration routingRulesConfig = configuration.getRoutingRules();
         if (routingRulesConfig.isRulesEngineEnabled()) {
             try {

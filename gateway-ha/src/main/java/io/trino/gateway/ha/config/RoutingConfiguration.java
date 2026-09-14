@@ -24,6 +24,17 @@ public class RoutingConfiguration
     private boolean forwardedHeadersEnabled = true;
 
     private String defaultRoutingGroup = "adhoc";
+    private PrincipalRoutingConfiguration principalRouting = new PrincipalRoutingConfiguration();
+
+    public PrincipalRoutingConfiguration getPrincipalRouting()
+    {
+        return principalRouting;
+    }
+
+    public void setPrincipalRouting(PrincipalRoutingConfiguration principalRouting)
+    {
+        this.principalRouting = principalRouting;
+    }
 
     public Duration getAsyncTimeout()
     {
