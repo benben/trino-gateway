@@ -31,15 +31,29 @@ deployment window. The readiness event records one observation, not continuous
 overlap. This workload does not yet test a long-running CPU query.
 
 The summary reports `submitted = succeeded + failed + unresolved` and
-`offered = submitted + not_submitted_capacity + not_submitted_pending`.
+`offered = submitted + not_submitted_capacity + not_submitted_stopped + not_submitted_statement_budget + not_submitted_pending`.
 Submitted means the client invoked the logical statement, not that Trino accepted
 or executed it. Failed means the client observed a failure; backend execution can
 still be uncertain. Unresolved means an invoked operation has no recorded client
 outcome. Pending means an offered operation has not reached the client invocation.
 Capacity drops remain explicit failures of workload coverage.
 
+The first failure or capacity drop requests a graceful stop. The workload stops
+offering new autocommit work, skips already offered statements that have not
+started, releases the retained-result pause, and attempts to roll back open transactions.
+Already running requests keep their existing deadlines. Releasing the pause
+continues normal result polling; it does not retry a failed request or replay SQL.
+Cleanup failures retain their ordinary failure and private-recovery reporting.
+
+Ctrl+C requests the same graceful stop. Wait for the final summary before exiting
+the process. The summary separates planned autocommit arrivals that were never
+offered from offered statements stopped before submission. It also reports aborted
+transactions and threads that never started. A stopped run always exits nonzero,
+including a user interruption with no query failure. This procedure does not
+certify that failed queries stopped executing or remove Gateway ledger records.
+
 Zero-error acceptance requires both equations, at least one submitted operation,
-no failures, unresolved operations, capacity drops, or pending offers, and the
+no failures, unresolved operations, capacity drops, stopped, budget-skipped or pending offers, and the
 existing transaction, retained-result, and rollout-readiness checks. HTTP page
 counts are separate from logical-statement counts. Operation events contain no
 SQL text, credentials, result rows, or continuation capabilities.
@@ -52,6 +66,41 @@ The accounting helper supports a separately identified explicit continuation
 resumption linked to its failed original operation. The workload does not perform
 automatic resumption. A successful resumption never changes the original failure
 or makes the original run satisfy zero-error acceptance.
+
+### Optional statement budget
+
+Set `--max-concurrent-statements` to a positive integer when the warehouse has a
+limited active-query budget. This optional limit covers every complete statement,
+from initial submission through its final result page, including BEGIN, reads,
+COMMIT, ROLLBACK and cleanup. A retained result holds its slot during the pause.
+An idle open transaction does not hold a slot between statements. Three open
+transactions plus a retained result therefore do not require four active statements.
+Without this option, the existing concurrency behavior remains unchanged.
+
+Offered operations wait in FIFO order before submission. `operation_client_wait`
+events report this delay separately from query latency. The arrival schedule still
+offers autocommit work at the requested rate; the existing 16-task bound remains.
+If that bound fills, the run records the dropped offer and stops. The budget does
+not turn an excessive offered rate into a successful lower-throughput test.
+Choose a rate the warehouse can sustain and verify the readiness event before
+starting a rollout. This client limit does not reserve capacity against other clients.
+
+A failed dispatched statement retains its slot because backend execution may
+continue. The workload stops ordinary admissions before another waiter can use
+that slot. Running peers may finish. Cleanup uses only immediately available safe
+slots; otherwise it records `not_submitted_statement_budget`, without waiting
+indefinitely or exceeding the configured limit. The summary includes remaining
+occupied slots, uncertain statements, and `transactions_left_open` when applicable.
+Neither a failed query nor a skipped cleanup counts as success.
+
+If a known transaction remains open, `transaction_recovery_required` reports its
+workload index without exposing the transaction ID. With `--recovery-directory`,
+it saves a mode-0600 `rollout-open-transaction-v1` record containing the known ID
+and connection-context hash. This is an operator recovery record, not a query
+continuation file; do not pass it to `--resume-file`. No transaction ID is invented
+when the initial response was lost. Without private recovery persistence, known
+transaction IDs disappear when the process exits. Recovery still requires the
+original connection identity and credentials, supplied separately by the operator.
 
 ### Failed continuations
 
@@ -86,7 +135,8 @@ repeat result pages; this is not an exactly-once result consumer.
 
 Transaction handles can resume only in memory on a client that still holds the
 same transaction identity. The CLI cannot recreate that session from a file.
-Workload cleanup attempts ROLLBACK after failures, which can invalidate transaction
+Workload cleanup attempts ROLLBACK after failures when its statement budget permits,
+which can invalidate transaction
 continuations. Expired Trino results, a lost coordinator, or a missing initial
 response may make recovery impossible. These helpers do not clear Gateway ledger
 records or certify that an abandoned query has stopped executing.
@@ -127,5 +177,5 @@ not the unfinished Kargo integration.
 Run local unit checks with:
 
 ```sh
-python3 -m unittest -v test_rollout_client test_manual_cutover_smoke
+python3 -m unittest -v test_rollout_client test_rollout_workload test_statement_budget test_manual_cutover_smoke
 ```

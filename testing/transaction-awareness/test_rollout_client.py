@@ -4,6 +4,7 @@ import unittest
 import os
 from pathlib import Path
 import tempfile
+import threading
 from unittest.mock import patch
 
 from protocol import Response
@@ -271,6 +272,18 @@ class RolloutClientTest(unittest.TestCase):
     def test_terminal_null_optional_fields_are_valid(self, request):
         request.return_value = response({"id": "q_owner", "data": None, "error": None, "nextUri": None})
         self.assertEqual(self.client().query("SELECT 1")["rows"], [])
+
+    @patch("rollout_client.time.sleep")
+    @patch("rollout_client.request")
+    def test_stop_releases_retained_pause_without_replaying_statement(self, request, sleep):
+        release = threading.Event()
+        request.side_effect = [response({"id": "q_owner", "nextUri": "https://gateway.example/page"}),
+                               response({"id": "q_owner", "data": [[1]]})]
+        result = self.client().query("SELECT 1", first_page_pause=500,
+                                     first_page_callback=release.set, first_page_release=release)
+        self.assertEqual(result["rows"], [[1]])
+        self.assertEqual([call.args[1] for call in request.call_args_list], ["POST", "GET"])
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

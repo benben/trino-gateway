@@ -151,10 +151,11 @@ class RolloutClient:
                 self.origin.scheme, self.origin.hostname, self.origin.port)):
             raise RuntimeError("continuation_origin")
 
-    def query(self, sql, deadline_seconds=60, max_pages=500, first_page_pause=0, first_page_callback=None):
+    def query(self, sql, deadline_seconds=60, max_pages=500, first_page_pause=0, first_page_callback=None,
+              first_page_release=None):
         self.pending_continuation = None
         return self._guarded_run(self.server + "/v1/statement", "POST", sql, None, 0,
-                                 deadline_seconds, max_pages, first_page_pause, first_page_callback)
+                                 deadline_seconds, max_pages, first_page_pause, first_page_callback, first_page_release)
 
     def resume(self, handle, deadline_seconds=60, max_pages=500):
         if handle.context_hash != self.context_hash or self.transaction != handle.transaction_id:
@@ -162,7 +163,7 @@ class RolloutClient:
         self.validate_continuation(handle.next_uri)
         self.pending_continuation = handle
         result = self._guarded_run(handle.next_uri, "GET", None, handle.query_id, handle.previous_rows,
-                                   deadline_seconds, max_pages, 0, None)
+                                   deadline_seconds, max_pages, 0, None, None)
         return {**result, "resumed": True, "previous_rows": handle.previous_rows}
 
     def _guarded_run(self, *args):
@@ -176,7 +177,7 @@ class RolloutClient:
             raise RolloutFailure(message, self.pending_continuation) from None
 
     def _run(self, url, method, body, identity, previous_rows, deadline_seconds, max_pages,
-             first_page_pause, first_page_callback):
+             first_page_pause, first_page_callback, first_page_release):
         started = time.monotonic()
         deadline = started + deadline_seconds
         rows, started_ids = [], set()
@@ -236,7 +237,10 @@ class RolloutClient:
             if page == 0 and first_page_pause:
                 if first_page_callback:
                     first_page_callback()
-                time.sleep(first_page_pause)
+                if first_page_release is None:
+                    time.sleep(first_page_pause)
+                else:
+                    first_page_release.wait(first_page_pause)
             url, method, body = payload["nextUri"], "GET", None
         raise RuntimeError("query_page_limit")
 
