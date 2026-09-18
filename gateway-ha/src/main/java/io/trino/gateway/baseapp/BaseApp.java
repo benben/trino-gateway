@@ -135,6 +135,8 @@ public class BaseApp
         jaxrsBinder(binder).bind(AuthorizedExceptionMapper.class);
         binder.bind(ProxyHandlerStats.class).in(Scopes.SINGLETON);
         binder.bind(io.trino.gateway.ha.transaction.TransactionAwarenessService.class).in(Scopes.SINGLETON);
+        binder.bind(io.trino.gateway.ha.transaction.PoolLifecycleService.class).in(Scopes.SINGLETON);
+        binder.bind(io.trino.gateway.ha.clustermonitor.PoolMonitoringScope.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ProxyHandlerStats.class).withGeneratedName();
         binder.bind(RoutingRulesManager.class);
         binder.bind(ClusterMetricsStatsExporter.class).in(Scopes.SINGLETON);
@@ -171,6 +173,7 @@ public class BaseApp
     private static void registerResources(Binder binder)
     {
         jaxrsBinder(binder).bind(io.trino.gateway.ha.resource.TransactionResource.class);
+        jaxrsBinder(binder).bind(io.trino.gateway.ha.resource.PoolResource.class);
         jaxrsBinder(binder).bind(EntityEditorResource.class);
         jaxrsBinder(binder).bind(GatewayResource.class);
         jaxrsBinder(binder).bind(GatewayViewResource.class);

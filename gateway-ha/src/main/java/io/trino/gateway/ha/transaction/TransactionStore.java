@@ -60,7 +60,18 @@ public final class TransactionStore
         return new TransactionStore(jdbi, requireNonNull(operation, "operation is null"));
     }
 
-    public record BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId) {}
+    /**
+     * @param poolId set when this backend is a pooled member. It records which transport a probe of
+     *         this backend must describe, so a pooled member reached over internal HTTP is probed
+     *         differently from a legacy backend without an extra read to find that out.
+     */
+    public record BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId, @Nullable String poolId)
+    {
+        public BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId)
+        {
+            this(name, incarnation, url, externalUrl, routingGroup, nodeId, coordinatorId, null);
+        }
+    }
 
     public record Admission(UUID id, BackendRef backend, String ownerHash, @Nullable String transactionId, @Nullable String queryId) {}
 
@@ -88,7 +99,7 @@ public final class TransactionStore
 
     public enum ErrorCode
     {
-        NOT_FOUND, OWNER_MISMATCH, CONFLICT, SEALED, NOT_DRAINED, NOT_ACTIVE, STALE_GENERATION
+        NOT_FOUND, OWNER_MISMATCH, CONFLICT, SEALED, NOT_DRAINED, NOT_ACTIVE, STALE_GENERATION, TENANT_NOT_ADMITTED
     }
 
     public static final class StoreException
@@ -124,6 +135,8 @@ public final class TransactionStore
                 proposed.nodeId(),
                 proposed.coordinatorId());
         return jdbi.inTransaction(handle -> {
+            lockRoute(handle, canonical.routingGroup(), false);
+            checkLegacyMode(handle, canonical.routingGroup());
             handle.createUpdate(
                             """
                             INSERT INTO transaction_backend (incarnation, name, current_name, backend_url, external_url, routing_group, node_id, coordinator_id, state)
@@ -159,10 +172,42 @@ public final class TransactionStore
         return jdbi.withHandle(handle -> findTransaction(handle, transactionId));
     }
 
+    /**
+     * Admits new independent work to one pooled member. The candidate was chosen from an advisory
+     * snapshot, so the member's phase is revalidated here under the pool's share lock: this is the
+     * boundary where eligibility and lifecycle transitions serialize against each other.
+     */
+    /**
+     * The one principal a request will be authenticated as, resolved to its tenant through the
+     * controller-published mapping in the same transaction as the admission itself. No principal, or a
+     * principal the mapping does not name, is refused: the restriction fails closed.
+     */
+    public record TenantGate(@Nullable String principal) {}
+
+    public Admission admitPooledMember(String poolId, String backendName, String ownerHash)
+    {
+        return admitPooledMember(poolId, backendName, ownerHash, null);
+    }
+
+    public Admission admitPooledMember(String poolId, String backendName, String ownerHash, @Nullable TenantGate gate)
+    {
+        return jdbi.inTransaction(handle -> {
+            lockRoute(handle, poolId, false);
+            check(isPooledMode(handle, poolId), ErrorCode.CONFLICT, "Routing group is not in pooled mode");
+            checkTenantAdmitted(handle, poolId, gate);
+            BackendRef backend = shareBackend(handle, backendName);
+            check(poolId.equals(memberPool(handle, backend)), ErrorCode.CONFLICT, "Backend is not a member of this pool");
+            check(backend.routingGroup().equals(poolId), ErrorCode.CONFLICT, "Backend belongs to another routing group");
+            check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Member does not accept new statements");
+            return insertAdmission(handle, backend, ownerHash, null, null);
+        });
+    }
+
     public Admission admitNew(String candidateName, String ownerHash, String routingGroup)
     {
         return jdbi.inTransaction(handle -> {
             lockRoute(handle, routingGroup, false);
+            check(!isPooledMode(handle, routingGroup), ErrorCode.CONFLICT, "Pooled routing groups admit through the member lifecycle protocol");
             String selected = findRoute(handle, routingGroup).orElse(candidateName);
             BackendRef backend = shareBackend(handle, selected);
             check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
@@ -359,6 +404,7 @@ public final class TransactionStore
     {
         return jdbi.inTransaction(handle -> {
             lockRoute(handle, routingGroup);
+            checkLegacyMode(handle, routingGroup);
             RolloutStore.requireGuard(handle, routingGroup, operation);
             check(operation == null, ErrorCode.CONFLICT, "Rollouts must use compare-and-set routing");
             BackendRef backend = lockBackend(handle, backendName);
@@ -381,6 +427,7 @@ public final class TransactionStore
     {
         return jdbi.inTransaction(handle -> {
             lockRoute(handle, routingGroup);
+            checkLegacyMode(handle, routingGroup);
             var owner = RolloutStore.requireGuard(handle, routingGroup, operation);
             if (owner != null) {
                 check(owner.plan().targetBackend().equals(backendName) && List.of("VERIFIED", "CUTOVER").contains(owner.phase()), ErrorCode.CONFLICT, "Rollout route mutation is out of phase");
@@ -453,6 +500,7 @@ public final class TransactionStore
     {
         return jdbi.inTransaction(handle -> {
             lockRoute(handle, routingGroup);
+            checkLegacyMode(handle, routingGroup);
             RolloutStore.requireGuard(handle, routingGroup, operation);
             check(operation == null, ErrorCode.CONFLICT, "Rollouts cannot remove the durable route");
             return handle.createQuery(
@@ -590,6 +638,7 @@ public final class TransactionStore
     {
         BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
         lockRoute(handle, observed.routingGroup());
+        checkLegacyMode(handle, observed.routingGroup());
         var owner = RolloutStore.requireGuard(handle, observed.routingGroup(), operation);
         if (owner != null) {
             boolean source = name.equals(owner.plan().sourceBackend());
@@ -651,7 +700,8 @@ public final class TransactionStore
                 rs.getString("external_url"),
                 rs.getString("routing_group"),
                 rs.getString("node_id"),
-                rs.getString("coordinator_id"));
+                rs.getString("coordinator_id"),
+                rs.getString("pool_id"));
     }
 
     private static String backendState(Handle handle, BackendRef backend)
@@ -659,9 +709,75 @@ public final class TransactionStore
         return handle.createQuery("SELECT state FROM transaction_backend WHERE incarnation = :id").bind("id", backend.incarnation()).mapTo(String.class).one();
     }
 
+    /**
+     * Continuations and statements inside an already bound transaction survive a drain, but not a
+     * seal, an irreversible retirement claim, or a proven process loss.
+     */
     private static void checkNotSealed(Handle handle, BackendRef backend)
     {
-        check(!backendState(handle, backend).equals("SEALED"), ErrorCode.SEALED, "Backend is sealed");
+        check(!List.of("SEALED", "RETIRING", "RETIRED", "LOST").contains(backendState(handle, backend)), ErrorCode.SEALED, "Backend is sealed");
+    }
+
+    /**
+     * Deny-only admission restriction. It never grants access: the coordinator still verifies the
+     * credential and its authorization policy still refuses impersonation. It only refuses to
+     * dispatch new independent work whose claimed tenant is not admitted, and fails closed when the
+     * claim names no admitted tenant at all.
+     * <p>
+     * Query continuations and statements inside an already bound transaction are not restricted here,
+     * so work that was already dispatched stays pinned and observable.
+     */
+    private static void checkTenantAdmitted(Handle handle, String poolId, @Nullable TenantGate gate)
+    {
+        boolean enabled = handle.createQuery("SELECT tenant_admission_enabled FROM pool WHERE pool_id = :pool")
+                .bind("pool", poolId).mapTo(Boolean.class).findOne().orElse(false);
+        if (!enabled) {
+            return;
+        }
+        check(gate != null && gate.principal() != null, ErrorCode.TENANT_NOT_ADMITTED, "The request presents no credential to restrict");
+        // Exactly the one principal the coordinator will authenticate is resolved. Its tenant comes
+        // from the published mapping, never from the shape of the name: a tenant's logins include a
+        // root name with no separator, and the tenant identifier is not a prefix of them.
+        //
+        // An unmapped principal is unknown and fails closed. It must not fall back to any other name:
+        // the coordinator qualifies before authenticating and checks only the qualified name, so an
+        // unrelated mapping for the name as typed says nothing about this request.
+        Optional<String> state = handle.createQuery(
+                        """
+                        SELECT coalesce(a.state, 'PENDING') AS state
+                        FROM pool_tenant_principal p
+                        LEFT JOIN pool_tenant_admission a ON a.pool_id = p.pool_id AND a.tenant = p.tenant
+                        WHERE p.pool_id = :pool AND p.principal = :principal
+                        """)
+                .bind("pool", poolId).bind("principal", gate.principal())
+                .mapTo(String.class).findOne();
+        check(state.isPresent(), ErrorCode.TENANT_NOT_ADMITTED, "This principal is not published for any tenant of this pool");
+        // A caller can only ever lose access this way, never gain it: the coordinator still verifies
+        // the credential itself and its policy still authorizes the query.
+        check(state.orElseThrow().equals("ADMITTED"),
+                ErrorCode.TENANT_NOT_ADMITTED,
+                "This principal belongs to a tenant that is not admitted");
+    }
+
+    static boolean isPooledMode(Handle handle, String routingGroup)
+    {
+        return handle.createQuery("SELECT api_mode = 'POOLED' FROM pool WHERE pool_id = :group")
+                .bind("group", routingGroup).mapTo(Boolean.class).findOne().orElse(false);
+    }
+
+    /**
+     * Legacy administrative mutations fail closed once a routing group switches to pooled mode.
+     */
+    private static void checkLegacyMode(Handle handle, String routingGroup)
+    {
+        check(!isPooledMode(handle, routingGroup), ErrorCode.CONFLICT, "Pooled routing groups use the member lifecycle protocol");
+    }
+
+    @Nullable
+    private static String memberPool(Handle handle, BackendRef backend)
+    {
+        return handle.createQuery("SELECT pool_id FROM transaction_backend WHERE incarnation = :id")
+                .bind("id", backend.incarnation()).mapTo(String.class).findOne().orElse(null);
     }
 
     private static boolean isComplete(Handle handle, UUID admissionId)

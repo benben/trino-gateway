@@ -53,7 +53,7 @@ jobs:
           export GATEWAY_TEST_JAVA="$JAVA_HOME/bin/java"
           export GATEWAY_TEST_PG_BIN="$(pg_config --bindir)"
           cd testing/transaction-awareness
-          python3 -m unittest -v test_rollout_api test_graceful_shutdown
+          python3 -m unittest -v test_rollout_api test_graceful_shutdown test_pool_lifecycle
       - name: Disposable lab tooling tests
         working-directory: testing/transaction-awareness/deploy
         env:

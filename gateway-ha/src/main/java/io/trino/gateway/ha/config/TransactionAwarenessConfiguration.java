@@ -29,6 +29,17 @@ public class TransactionAwarenessConfiguration
     private int requestTimeoutMillis = 120000;
     private int processInfoTimeoutMillis = 5000;
     private int completionTimeoutMillis = 10000;
+    private PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+
+    public PoolLifecycleConfiguration getPool()
+    {
+        return pool;
+    }
+
+    public void setPool(PoolLifecycleConfiguration pool)
+    {
+        this.pool = pool == null ? new PoolLifecycleConfiguration() : pool;
+    }
 
     public int getMaxInFlightRequests()
     {
@@ -122,8 +133,19 @@ public class TransactionAwarenessConfiguration
         this.terminalRetentionSeconds = terminalRetentionSeconds;
     }
 
+    /**
+     * Validates against the default routing configuration. Callers that own a routing configuration
+     * must use {@link #validate(DataStoreConfiguration, RoutingConfiguration)} instead, because the
+     * pooled tenant restriction depends on forwarded-header handling.
+     */
     public void validate(DataStoreConfiguration dataStore)
     {
+        validate(dataStore, new RoutingConfiguration());
+    }
+
+    public void validate(DataStoreConfiguration dataStore, RoutingConfiguration routing)
+    {
+        pool.validate(enabled, routing == null || routing.isForwardedHeadersEnabled());
         if (!enabled) {
             return;
         }

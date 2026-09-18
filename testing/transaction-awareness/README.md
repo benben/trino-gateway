@@ -133,6 +133,31 @@ These suites require explicit fault opt-in. Their assertions compare obligation 
 
 The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields: a URL followed by `null`. Rejection must preserve uncertainty instead of making the query appear complete.
 
+## Pooled member lifecycle
+
+`test_pool_lifecycle` runs the pooled member protocol through the same two-JVM,
+one-PostgreSQL fixture as `test_rollout_api`, with synthetic coordinators. It
+covers bootstrap to the desired member count without deadlocking on the serving
+floor, one allowed surge member and the refusal of the next, a replayed
+admission resolved from the other replica, three concurrent drains of which the
+serving floor grants two, dispatch restricted to serving members from both
+replicas, leader takeover with its own step identity and the refusal of the
+predecessor's epoch, and a transaction plus a query continuation staying pinned
+to a draining member while new independent work is routed elsewhere. It also
+covers replacing a member that never recovered: a suspected member drains, keeps
+its pinned work, refuses re-admission, and retires as drained with no failure
+receipt, while a planned drain of a serving member is still refused by the
+serving floor.
+
+`local_gateways` takes an optional `pool` block and `backend_names`. Both
+default to the previous behaviour, so every other suite runs the legacy
+configuration with two backends and no pool configuration at all.
+
+This is the Gateway's own multi-process serialization and routing over real
+HTTP. It starts no Kubernetes, no real coordinator and no credential store, so
+it establishes nothing about backend authentication, tenant admission against a
+real password store, or any timing or zero-downtime property.
+
 ## Limits of this suite
 
 ### Gateway process shutdown

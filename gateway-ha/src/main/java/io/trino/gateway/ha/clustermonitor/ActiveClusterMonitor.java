@@ -43,6 +43,7 @@ public class ActiveClusterMonitor
 
     private final Duration taskDelay;
     private final ClusterStatsMonitor clusterStatsMonitor;
+    private final PoolMonitoringScope poolMonitoringScope;
     private final ExecutorService executorService = Executors.newFixedThreadPool(DEFAULT_THREAD_POOL_SIZE);
     private final ScheduledExecutorService scheduledExecutor = Executors.newSingleThreadScheduledExecutor();
 
@@ -51,9 +52,11 @@ public class ActiveClusterMonitor
             Set<TrinoClusterStatsObserver> clusterStatsObservers,
             GatewayBackendManager gatewayBackendManager,
             MonitorConfiguration monitorConfiguration,
-            ClusterStatsMonitor clusterStatsMonitor)
+            ClusterStatsMonitor clusterStatsMonitor,
+            PoolMonitoringScope poolMonitoringScope)
     {
         this.clusterStatsMonitor = requireNonNull(clusterStatsMonitor, "clusterStatsMonitor is null");
+        this.poolMonitoringScope = requireNonNull(poolMonitoringScope, "poolMonitoringScope is null");
         this.clusterStatsObservers = requireNonNull(clusterStatsObservers, "clusterStatsObservers is null");
         this.gatewayBackendManager = requireNonNull(gatewayBackendManager, "gatewayBackendManager is null");
         this.taskDelay = monitorConfiguration.getTaskDelay();
@@ -67,7 +70,7 @@ public class ActiveClusterMonitor
             try {
                 log.info("Getting stats for all clusters");
                 List<ProxyBackendConfiguration> allClusters =
-                        gatewayBackendManager.getAllBackends();
+                        poolMonitoringScope.monitored(gatewayBackendManager.getAllBackends());
                 List<Future<ClusterStats>> futures = new ArrayList<>();
                 for (ProxyBackendConfiguration backend : allClusters) {
                     Future<ClusterStats> call = executorService.submit(() -> clusterStatsMonitor.monitor(backend));
