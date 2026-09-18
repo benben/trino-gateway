@@ -589,7 +589,20 @@ public final class PoolStore
     }
 
     /**
-     * Planned drain. Refused when it would take the pool below its minimum serving floor.
+     * Drain, from {@code ACTIVE} (planned) or from {@code SUSPECT} (replacement of a member that never
+     * recovered).
+     * <p>
+     * A planned drain spends serving capacity, so it is refused when it would take the pool below its
+     * minimum serving floor. A suspect drain spends none — a suspected member was already excluded
+     * from the serving set and from new independent admissions — so the floor does not gate it and the
+     * active count is not decremented on its behalf. Refusing it against the floor would block exactly
+     * the cleanup a degraded pool needs.
+     * <p>
+     * Draining a suspect is not recovery and not a claim that its process ended: it keeps every pinned
+     * obligation, stays unroutable for new work, and can only move on to {@code SEALED} once those
+     * obligations are actually gone. There is no path back to {@code ACTIVE} from either phase — a
+     * replacement member registers and certifies itself instead. A member whose process is genuinely
+     * gone still needs the failure path, which records evidence for that exact incarnation.
      */
     public Member drainMember(String poolId, String instanceId, Guard guard, long expectedGeneration)
     {
@@ -598,12 +611,17 @@ public final class PoolStore
             Row row = lockedMember(handle, poolId, instanceId);
             requireGeneration(row, expectedGeneration);
             check(!IRREVERSIBLE_PHASES.contains(row.state), POOL_IRREVERSIBLE, "A retiring or retired member cannot be drained");
-            check(row.state.equals("ACTIVE"), POOL_PHASE, "Only an active member can begin a planned drain");
-            long active = countMembers(handle, poolId, Set.of("ACTIVE"));
-            check(active - 1 >= pool.minServing, POOL_SERVING_FLOOR, "A planned drain cannot take the pool below its minimum serving count");
+            check(Set.of("ACTIVE", "SUSPECT").contains(row.state), POOL_PHASE, "Only an active or suspect member can be drained");
+            boolean wasServing = row.state.equals("ACTIVE");
+            if (wasServing) {
+                long active = countMembers(handle, poolId, Set.of("ACTIVE"));
+                check(active - 1 >= pool.minServing, POOL_SERVING_FLOOR, "A planned drain cannot take the pool below its minimum serving count");
+            }
             handle.createUpdate("UPDATE transaction_backend SET state = 'DRAINING', generation = generation + 1 WHERE incarnation = :id")
                     .bind("id", row.incarnation).execute();
-            long membership = bumpMembership(handle, poolId);
+            // Only a change to the serving set is a membership change: a suspect was already outside it,
+            // so bumping here would conflict an open publication barrier for no reason.
+            long membership = wasServing ? bumpMembership(handle, poolId) : pool.membershipGeneration;
             return member(handle, poolId, instanceId, pool.withMembership(membership));
         });
     }

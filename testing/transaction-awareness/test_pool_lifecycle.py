@@ -256,6 +256,119 @@ class PoolLifecycleContract(unittest.TestCase):
                               CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
             self.assertNotEqual(refused.status, 200)
 
+    def test_a_suspected_member_is_replaced_through_the_drain_path(self):
+        """A member that never recovered is replaced without claiming its process ended."""
+        with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            epoch = 5
+            self.successful(self.configure(api, epoch, "configure"))
+            members = {}
+            for index, backend in enumerate(backends):
+                member = self.bootstrap(api, backend, epoch, "op-boot-" + backend.state.identity, replica=index % 2)
+                members[member["instanceId"]] = member
+            by_coordinator = {backend.state.coordinator_id: backend.state.identity for backend in backends}
+
+            # Pin a transaction and a query continuation to the member that is about to be suspected.
+            started = request(gateways[0] + "/v1/statement", "POST", "START TRANSACTION", CREDENTIAL)
+            self.assertEqual(started.status, 200, started.body)
+            transaction = started.values("X-Trino-Started-Transaction-Id")
+            for page in finish(started, gateways[0]):
+                self.assertEqual(page.status, 200, page.body)
+            owner = by_coordinator[started.json()["id"].rsplit("_", 1)[1]]
+            pending = request(gateways[0] + "/v1/statement", "POST", "SELECT 1",
+                              CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+            self.assertEqual(pending.status, 200, pending.body)
+            continuation = pending.json()["nextUri"]
+
+            # A failed probe is not absence: suspecting stops new work and blocks the pool.
+            suspected = self.successful(api("/members/" + owner + "/suspect", "POST",
+                                            {"operationId": "op-suspect", "stepId": "suspect", "controllerEpoch": epoch,
+                                             "ownerIdentity": self.OWNER, "expectedGeneration": members[owner]["generation"],
+                                             "reason": "identity probe failed repeatedly"}, replica=1))
+            self.assertEqual(suspected["phase"], "SUSPECT")
+            self.assertFalse(suspected["eligible"])
+            blocked = self.successful(api(""))
+            self.assertIn("SUSPECT_MEMBER", blocked["blocked"])
+            self.assertEqual(blocked["servingMembers"], 2)
+
+            # The floor is unchanged by the suspicion, so a planned drain of a serving member is refused
+            # while the suspect itself drains: it holds no serving capacity to give up.
+            other = next(name for name in members if name != owner)
+            self.refused(api("/members/" + other + "/drain", "POST",
+                             {"operationId": "op-planned-drain", "stepId": "drain", "controllerEpoch": epoch,
+                              "ownerIdentity": self.OWNER, "expectedGeneration": members[other]["generation"]}),
+                         "POOL_SERVING_FLOOR")
+            drain_body = {"operationId": "op-suspect-drain", "stepId": "drain", "controllerEpoch": epoch,
+                          "ownerIdentity": self.OWNER, "expectedGeneration": suspected["generation"]}
+            draining = self.successful(api("/members/" + owner + "/drain", "POST", drain_body, replica=1))
+            self.assertEqual(draining["phase"], "DRAINING")
+            self.assertFalse(draining["eligible"])
+            after = self.successful(api("", replica=1))
+            self.assertEqual(after["servingMembers"], 2)
+            self.assertNotIn("SUSPECT_MEMBER", after["blocked"])
+
+            # A lost response is resolvable from either replica and is not a second drain.
+            replayed = self.successful(api("/members/" + owner + "/drain", "POST", drain_body))
+            self.assertTrue(replayed["replayed"])
+            self.assertEqual(replayed["generation"], draining["generation"])
+
+            # Everything pinned to it survives, through either replica.
+            page = request(through_gateway(continuation, gateways[1]))
+            self.assertEqual(page.status, 200, page.body)
+            self.assertEqual(page.json()["id"], pending.json()["id"])
+            self.assertNotIn("error", page.json())
+            for page in finish(page, gateways[1]):
+                self.assertEqual(page.status, 200, page.body)
+                self.assertNotIn("error", page.json())
+            inside = request(gateways[1] + "/v1/statement", "POST", "SELECT 2",
+                             CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+            self.assertEqual(inside.status, 200, inside.body)
+            self.assertEqual(by_coordinator[inside.json()["id"].rsplit("_", 1)[1]], owner)
+            for page in finish(inside, gateways[1]):
+                self.assertEqual(page.status, 200, page.body)
+                self.assertNotIn("error", page.json())
+
+            # New independent work never lands there, from either replica.
+            for replica in (0, 1):
+                for _ in range(4):
+                    self.assertNotEqual(self.served_by(gateways, replica=replica), owner)
+
+            # There is no way back to service: re-certifying it is refused, and it is already draining.
+            self.refused(api("/members/" + owner + "/admit", "POST",
+                             dict(self.admissions[owner], operationId="op-readmit",
+                                  expectedGeneration=draining["generation"]), replica=1),
+                         "POOL_PHASE")
+            self.assertEqual(self.successful(api("/members/" + owner, replica=1))["phase"], "DRAINING")
+
+            # It seals only when its obligations really ended, and then retires as drained, not failed.
+            committed = request(gateways[0] + "/v1/statement", "POST", "COMMIT",
+                                CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+            self.assertEqual(committed.status, 200, committed.body)
+            pages = finish(committed, gateways[0])
+            self.assertTrue(any(page.values("X-Trino-Clear-Transaction-Id") for page in pages))
+            deadline = time.monotonic() + 10
+            while not self.successful(api("/members/" + owner + "/obligations"))["readyToSeal"]:
+                self.assertLess(time.monotonic(), deadline, "Suspected member never became sealable")
+                time.sleep(0.1)
+            current = self.successful(api("/members/" + owner, replica=1))
+            sealed = self.successful(api("/members/" + owner + "/seal", "POST",
+                                        {"operationId": "op-seal", "stepId": "seal", "controllerEpoch": epoch,
+                                         "ownerIdentity": self.OWNER, "expectedGeneration": current["generation"]}))
+            self.assertEqual(sealed["phase"], "SEALED")
+            retiring = self.successful(api("/members/" + owner + "/retire", "POST",
+                                           {"operationId": "op-retire", "stepId": "retire", "controllerEpoch": epoch,
+                                            "ownerIdentity": self.OWNER, "expectedGeneration": sealed["generation"]}))
+            self.assertEqual(retiring["phase"], "RETIRING")
+            self.assertEqual(retiring["retirementKind"], "DRAINED")
+            # No failure receipt exists, because nothing claimed the process was gone.
+            self.assertEqual(api("/members/" + owner + "/failure-receipt", replica=1).status, 404)
+
+            final = self.successful(api("", replica=1))
+            self.assertEqual(final["counts"]["RETIRING"], 1)
+            self.assertEqual(final["counts"]["SUSPECT"], 0)
+            self.assertEqual(final["counts"]["LOST"], 0)
+            self.assertEqual(final["servingMembers"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

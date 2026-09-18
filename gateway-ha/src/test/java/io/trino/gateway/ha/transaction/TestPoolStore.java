@@ -990,6 +990,122 @@ class TestPoolStore
     }
 
     @Test
+    void aSuspectMemberThatNeverRecoveredIsReplacedThroughTheDrainPath()
+    {
+        // Replacing a persistently unhealthy member must not require claiming its process ended. A
+        // suspect drains, keeps everything pinned to it, and never returns to service.
+        configure(2, 3, 1, 1);
+        serving("i-keep-1");
+        serving("i-keep-2");
+        serving("i-1");
+        TransactionStore.Admission admission = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        transactions.recordResponse(admission.id(), new ResponseObservation("20260918_120000_00007_abcde", null, false, false, 120));
+        Member suspected = suspect("i-1");
+        assertThat(suspected.phase()).isEqualTo("SUSPECT");
+        assertThat(first.poolState(POOL).orElseThrow().blocked()).contains("SUSPECT_MEMBER");
+
+        long membershipBeforeDrain = first.poolState(POOL).orElseThrow().membershipGeneration();
+        Member draining = second.drainMember(POOL, "i-1", guard("op-suspect-drain", "drain"), suspected.generation());
+        assertThat(draining.phase()).isEqualTo("DRAINING");
+        assertThat(draining.eligible()).isFalse();
+        assertThat(draining.generation()).isEqualTo(suspected.generation() + 1);
+        // A suspect was already outside the serving set, so this is not a membership change.
+        assertThat(first.poolState(POOL).orElseThrow().membershipGeneration()).isEqualTo(membershipBeforeDrain);
+        PoolStore.PoolState afterDrain = second.poolState(POOL).orElseThrow();
+        assertThat(afterDrain.servingMembers()).isEqualTo(2);
+        assertThat(afterDrain.counts().get("SUSPECT")).isZero();
+        assertThat(afterDrain.counts().get("DRAINING")).isEqualTo(1);
+        assertThat(afterDrain.blocked()).doesNotContain("SUSPECT_MEMBER");
+
+        // Pinned work survives, new independent work does not land there, and there is no way back.
+        TransactionStore.Admission continued =
+                transactions.admitQuery("20260918_120000_00007_abcde", Optional.of("owner"), Optional.empty());
+        assertThat(continued.backend().name()).isEqualTo("backend-i-1");
+        assertThat(second.eligibleCandidates(POOL)).extracting(PoolStore.Candidate::instanceId)
+                .containsExactlyInAnyOrder("i-keep-1", "i-keep-2");
+        assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner"))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.NOT_ACTIVE));
+        assertThatThrownBy(() -> first.admitMember(
+                POOL,
+                "i-1",
+                guard("op-suspect-readmit", "admit"),
+                draining.generation(),
+                receipt("r-1", "i-1"),
+                "node-i-1",
+                "coord-i-1",
+                FRESHNESS))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
+
+        // It seals only once its obligations are really gone, so this never reports a drain it did not do.
+        assertThatThrownBy(() -> seal("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+        transactions.recordResponse(continued.id(), new ResponseObservation("20260918_120000_00007_abcde", null, false, true, 0));
+        Member sealed = seal("i-1");
+        assertThat(sealed.phase()).isEqualTo("SEALED");
+        assertThat(sealed.drained()).isTrue();
+        assertThat(retire("i-1").retirementKind()).isEqualTo("DRAINED");
+    }
+
+    @Test
+    void drainingASuspectIsNotGatedByTheFloorWhileAPlannedDrainStillIs()
+    {
+        // A suspect holds no serving capacity, so its drain cannot be what takes the pool below the
+        // floor. A planned drain of a member that is actually serving still is.
+        configure(2, 3, 1, 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        Member suspected = suspect("i-3");
+        assertThat(first.poolState(POOL).orElseThrow().servingMembers()).isEqualTo(2);
+        assertThatThrownBy(() -> drain(first, "i-2", "op-planned-below-floor"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SERVING_FLOOR));
+        assertThat(first.drainMember(POOL, "i-3", guard("op-suspect-floor", "drain"), suspected.generation()).phase())
+                .isEqualTo("DRAINING");
+        assertThat(first.poolState(POOL).orElseThrow().servingMembers()).isEqualTo(2);
+        assertThatThrownBy(() -> drain(second, "i-1", "op-planned-still-refused"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SERVING_FLOOR));
+    }
+
+    @Test
+    void onlyAnActiveOrSuspectMemberCanBeDrainedAndARetirementClaimStillCannotBe()
+    {
+        configure(1, 3, 1, 1);
+        serving("i-keep");
+        Member preparing = register("i-1");
+        assertThatThrownBy(() -> first.drainMember(POOL, "i-1", guard("op-drain-preparing", "drain"), preparing.generation()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
+        admit("i-1");
+        Member draining = drain(first, "i-1", "op-drain-once");
+        assertThatThrownBy(() -> first.drainMember(POOL, "i-1", guard("op-drain-twice", "drain"), draining.generation()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
+        seal("i-1");
+        Member retiring = retire("i-1");
+        assertThatThrownBy(() -> first.drainMember(POOL, "i-1", guard("op-drain-retiring", "drain"), retiring.generation()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_IRREVERSIBLE));
+    }
+
+    @Test
+    void aSuspectDrainIsFencedByGenerationAndAuthority()
+    {
+        configure(1, 3, 1, 1);
+        serving("i-1");
+        serving("i-keep");
+        Member suspected = suspect("i-1");
+        assertThatThrownBy(() -> second.drainMember(POOL, "i-1", guard("op-stale-generation", "drain"), suspected.generation() - 1))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_GENERATION));
+        assertThatThrownBy(() -> second.drainMember(
+                POOL, "i-1", new Guard("op-stale-epoch", "drain", epoch - 1, PLAN_HASH), suspected.generation()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_EPOCH));
+        assertThat(first.member(POOL, "i-1").orElseThrow().phase()).isEqualTo("SUSPECT");
+        Member draining = second.drainMember(POOL, "i-1", guard("op-suspect-drain", "drain"), suspected.generation());
+        // The recorded step resolves from either replica, so a lost response is not a second drain.
+        Member replayed = first.drainMember(POOL, "i-1", guard("op-suspect-drain", "drain"), suspected.generation());
+        assertThat(replayed.replayed()).isTrue();
+        assertThat(replayed.generation()).isEqualTo(draining.generation());
+    }
+
+    @Test
     void aLostMemberNeedsItsFailureReceiptBeforeRetirement()
     {
         configure(1, 3, 1, 1);

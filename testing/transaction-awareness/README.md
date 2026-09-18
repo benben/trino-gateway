@@ -143,7 +143,11 @@ admission resolved from the other replica, three concurrent drains of which the
 serving floor grants two, dispatch restricted to serving members from both
 replicas, leader takeover with its own step identity and the refusal of the
 predecessor's epoch, and a transaction plus a query continuation staying pinned
-to a draining member while new independent work is routed elsewhere.
+to a draining member while new independent work is routed elsewhere. It also
+covers replacing a member that never recovered: a suspected member drains, keeps
+its pinned work, refuses re-admission, and retires as drained with no failure
+receipt, while a planned drain of a serving member is still refused by the
+serving floor.
 
 `local_gateways` takes an optional `pool` block and `backend_names`. Both
 default to the previous behaviour, so every other suite runs the legacy
