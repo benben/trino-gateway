@@ -151,7 +151,7 @@ public class PoolLifecycleConfiguration
         this.forwardedProtoHttps = forwardedProtoHttps;
     }
 
-    public void validate(boolean transactionAwarenessEnabled)
+    public void validate(boolean transactionAwarenessEnabled, boolean forwardedHeadersEnabled)
     {
         if (!enabled) {
             return;
@@ -163,6 +163,16 @@ public class PoolLifecycleConfiguration
             throw new IllegalArgumentException("tenantIdentitySource must be one of " + TENANT_IDENTITY_SOURCES);
         }
         if (TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL.equals(tenantIdentitySource)) {
+            // The restriction decides on the principal the coordinator will authenticate, which depends
+            // on the host the coordinator sees. With routing.forwardedHeadersEnabled = false the
+            // Gateway sends no X-Forwarded-Host, so the coordinator qualifies with its own internal
+            // Service host instead of the client's, and the name checked here is not the name
+            // authenticated there. No verified alternative way to carry that host exists, so this is
+            // refused at startup rather than decided against the wrong identity.
+            if (!forwardedHeadersEnabled) {
+                throw new IllegalArgumentException("A tenant principal restriction requires routing.forwardedHeadersEnabled, "
+                        + "because the coordinator must qualify the credential with the client's host and not the internal Service host");
+            }
             // A coordinator may authenticate an unqualified name, so an empty domain list is valid: the
             // credential itself is then the only candidate. A malformed domain is not.
             for (String domain : hostQualificationDomains) {

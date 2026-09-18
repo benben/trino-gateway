@@ -133,9 +133,19 @@ public class TransactionAwarenessConfiguration
         this.terminalRetentionSeconds = terminalRetentionSeconds;
     }
 
+    /**
+     * Validates against the default routing configuration. Callers that own a routing configuration
+     * must use {@link #validate(DataStoreConfiguration, RoutingConfiguration)} instead, because the
+     * pooled tenant restriction depends on forwarded-header handling.
+     */
     public void validate(DataStoreConfiguration dataStore)
     {
-        pool.validate(enabled);
+        validate(dataStore, new RoutingConfiguration());
+    }
+
+    public void validate(DataStoreConfiguration dataStore, RoutingConfiguration routing)
+    {
+        pool.validate(enabled, routing == null || routing.isForwardedHeadersEnabled());
         if (!enabled) {
             return;
         }

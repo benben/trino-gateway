@@ -296,7 +296,7 @@ public class PoolLifecycleService
     {
         return guarded(() -> store.tenantAdmission(poolId, tenant)
                 .orElseGet(() -> new PoolStore.TenantAdmission(
-                        PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, null, List.of(), false)));
+                        PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, null, 0, null, List.of(), false)));
     }
 
     /**

@@ -335,6 +335,14 @@ public final class PoolStore
             @Nullable String admittedRevision,
             @Nullable String publicationId,
             @Nullable String principalRevision,
+            int principalCount,
+            @Nullable String principalsHash,
+            /**
+             * The published logins, echoed only by the read path. A write result is recorded as an
+             * idempotent step, so it must stay bounded no matter how many logins a tenant has; a
+             * publication response therefore carries {@code principalCount} and
+             * {@code principalsHash} instead and leaves this empty.
+             */
             List<String> principals,
             boolean replayed)
     {
@@ -907,24 +915,24 @@ public final class PoolStore
                     .bind("pool", poolId).bind("tenant", tenant)
                     .bindArray("principals", String.class, ordered.toArray(String[]::new))
                     .execute();
-            for (String principal : ordered) {
-                handle.createUpdate(
-                                """
-                                INSERT INTO pool_tenant_principal (pool_id, principal, tenant, revision)
-                                VALUES (:pool, :principal, :tenant, :revision)
-                                ON CONFLICT (pool_id, principal) DO UPDATE SET tenant = EXCLUDED.tenant,
-                                  revision = EXCLUDED.revision, updated_at = clock_timestamp()
-                                """)
-                        .bind("pool", poolId).bind("principal", principal).bind("tenant", tenant).bind("revision", revision)
-                        .execute();
-            }
+            handle.createUpdate(
+                            """
+                            INSERT INTO pool_tenant_principal (pool_id, principal, tenant, revision)
+                            SELECT :pool, published.principal, :tenant, :revision
+                            FROM unnest(:principals) AS published (principal)
+                            ON CONFLICT (pool_id, principal) DO UPDATE SET tenant = EXCLUDED.tenant,
+                              revision = EXCLUDED.revision, updated_at = clock_timestamp()
+                            """)
+                    .bind("pool", poolId).bind("tenant", tenant).bind("revision", revision)
+                    .bindArray("principals", String.class, ordered.toArray(String[]::new))
+                    .execute();
             handle.createUpdate(
                             """
                             INSERT INTO pool_tenant_admission (pool_id, tenant, state) VALUES (:pool, :tenant, 'PENDING')
                             ON CONFLICT (pool_id, tenant) DO NOTHING
                             """)
                     .bind("pool", poolId).bind("tenant", tenant).execute();
-            return tenantAdmission(handle, poolId, tenant, false);
+            return tenantAdmission(handle, poolId, tenant, false, false);
         });
     }
 
@@ -944,7 +952,7 @@ public final class PoolStore
                     .bind("pool", poolId).bind("tenant", tenant).execute();
             handle.createUpdate("UPDATE pool_publication SET phase = 'ABANDONED' WHERE pool_id = :pool AND tenant = :tenant AND phase = 'OPEN'")
                     .bind("pool", poolId).bind("tenant", tenant).execute();
-            return tenantAdmission(handle, poolId, tenant, false);
+            return tenantAdmission(handle, poolId, tenant, false, false);
         });
     }
 
@@ -1022,7 +1030,7 @@ public final class PoolStore
     {
         return jdbi.withHandle(handle -> handle.createQuery("SELECT 1 FROM pool_tenant_admission WHERE pool_id = :pool AND tenant = :tenant")
                 .bind("pool", poolId).bind("tenant", tenant).mapTo(Integer.class).findOne()
-                .map(_ -> tenantAdmission(handle, poolId, tenant, false)));
+                .map(_ -> tenantAdmission(handle, poolId, tenant, false, true)));
     }
 
     public OperationHistory operationHistory(String poolId, String operationId)
@@ -1451,7 +1459,7 @@ public final class PoolStore
                         rs.getString("applied_revision"),
                         rs.getString("auth_fingerprint")))
                 .list();
-        TenantAdmission admission = tenantAdmission(handle, row.poolId, row.tenant, false);
+        TenantAdmission admission = tenantAdmission(handle, row.poolId, row.tenant, false, false);
         return new Publication(
                 PROTOCOL_VERSION,
                 publicationId,
@@ -1468,14 +1476,31 @@ public final class PoolStore
                 false);
     }
 
-    private static TenantAdmission tenantAdmission(Handle handle, String poolId, String tenant, boolean replayed)
+    /**
+     * @param includePrincipals only for a read. A result that is recorded as an idempotent step must
+     *         not grow with a tenant's login count, so a write echoes the count and digest instead.
+     */
+    private static TenantAdmission tenantAdmission(Handle handle, String poolId, String tenant, boolean replayed, boolean includePrincipals)
     {
-        List<String> principals = handle.createQuery(
-                        "SELECT principal FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant ORDER BY principal")
-                .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).list();
-        String revision = handle.createQuery(
-                        "SELECT DISTINCT revision FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant")
-                .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).findFirst().orElse(null);
+        record Summary(String revision, int count, String hash) {}
+
+        Summary summary = handle.createQuery(
+                        """
+                        SELECT min(revision) AS revision, count(*) AS principal_count,
+                          encode(sha256(coalesce(string_agg(principal, E'\\n' ORDER BY principal), '')::bytea), 'hex') AS principals_hash
+                        FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant
+                        """)
+                .bind("pool", poolId).bind("tenant", tenant)
+                .map((rs, _) -> new Summary(rs.getString("revision"), rs.getInt("principal_count"), rs.getString("principals_hash")))
+                .one();
+        List<String> principals = includePrincipals && summary.count() > 0
+                ? handle.createQuery(
+                "SELECT principal FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant ORDER BY principal")
+                  .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).list()
+                : List.of();
+        String revision = summary.revision();
+        int principalCount = summary.count();
+        String principalsHash = principalCount == 0 ? null : summary.hash();
         return handle.createQuery("SELECT state, admitted_revision, publication_id FROM pool_tenant_admission WHERE pool_id = :pool AND tenant = :tenant")
                 .bind("pool", poolId).bind("tenant", tenant)
                 .map((rs, _) -> new TenantAdmission(
@@ -1486,10 +1511,13 @@ public final class PoolStore
                         rs.getString("admitted_revision"),
                         rs.getString("publication_id"),
                         revision,
+                        principalCount,
+                        principalsHash,
                         principals,
                         replayed))
                 .findOne()
-                .orElseGet(() -> new TenantAdmission(PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, revision, principals, replayed));
+                .orElseGet(() -> new TenantAdmission(
+                        PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, revision, principalCount, principalsHash, principals, replayed));
     }
 
     /**
@@ -1889,6 +1917,8 @@ public final class PoolStore
                     admission.admittedRevision(),
                     admission.publicationId(),
                     admission.principalRevision(),
+                    admission.principalCount(),
+                    admission.principalsHash(),
                     admission.principals(),
                     true);
             default -> Function.identity();

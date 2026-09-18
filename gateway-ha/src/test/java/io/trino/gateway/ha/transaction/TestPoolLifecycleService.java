@@ -106,7 +106,7 @@ class TestPoolLifecycleService
     {
         PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
         pool.setEnabled(true);
-        assertThatThrownBy(() -> pool.validate(false))
+        assertThatThrownBy(() -> pool.validate(false, true))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("requires transaction awareness");
     }
@@ -119,9 +119,40 @@ class TestPoolLifecycleService
         assertThat(pool.getTenantIdentitySource()).isEqualTo("NONE");
         assertThat(pool.hasVerifiedTenantIdentity()).isFalse();
         pool.setTenantIdentitySource("X-Trino-User");
-        assertThatThrownBy(() -> pool.validate(true))
+        assertThatThrownBy(() -> pool.validate(true, true))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("tenantIdentitySource");
+    }
+
+    @Test
+    void aTenantPrincipalRestrictionIsRefusedWhenForwardedHeadersAreDisabled()
+    {
+        PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+        pool.setEnabled(true);
+        pool.setTenantIdentitySource(PoolLifecycleConfiguration.TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
+        pool.setHostQualificationDomains(List.of("example.test"));
+        assertThatThrownBy(() -> pool.validate(true, false))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("routing.forwardedHeadersEnabled");
+        // The same configuration is accepted once the client host actually reaches the coordinator.
+        pool.validate(true, true);
+        // A pool without the restriction is unaffected by forwarded-header handling.
+        PoolLifecycleConfiguration unrestricted = new PoolLifecycleConfiguration();
+        unrestricted.setEnabled(true);
+        unrestricted.validate(true, false);
+    }
+
+    @Test
+    void aTenantPrincipalRestrictionIsRefusedThroughTheGatewayConfiguration()
+    {
+        configuration.getRouting().setForwardedHeadersEnabled(false);
+        PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+        pool.setEnabled(true);
+        pool.setTenantIdentitySource(PoolLifecycleConfiguration.TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
+        configuration.getTransactionAwareness().setPool(pool);
+        assertThatThrownBy(configuration::validate)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("routing.forwardedHeadersEnabled");
     }
 
     @Test

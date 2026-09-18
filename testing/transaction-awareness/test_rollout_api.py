@@ -35,7 +35,13 @@ def stop_process(process):
 
 
 @contextlib.contextmanager
-def local_gateways(form_auth=False, processes=None, server_config=None):
+def local_gateways(form_auth=False, processes=None, server_config=None, pool=None, backend_names=("blue", "green")):
+    """Two real Gateway processes over one disposable PostgreSQL, with synthetic coordinators.
+
+    ``pool`` is the optional ``transactionAwareness.pool`` block; omitted by default, so every
+    existing caller runs the legacy configuration unchanged. ``backend_names`` names the synthetic
+    coordinators, two by default.
+    """
     pg_bin = Path(os.environ["GATEWAY_TEST_PG_BIN"])
     with tempfile.TemporaryDirectory(prefix="gateway-rollout-api-") as directory, contextlib.ExitStack() as cleanup:
         root = Path(directory)
@@ -46,7 +52,7 @@ def local_gateways(form_auth=False, processes=None, server_config=None):
         token = secrets.token_hex(32)
         key = secrets.token_hex(32)
         backends = []
-        for name in ("blue", "green"):
+        for name in backend_names:
             backend = make_server(identity=name)
             threading.Thread(target=backend.serve_forever, daemon=True).start()
             cleanup.callback(backend.server_close)
@@ -64,6 +70,8 @@ def local_gateways(form_auth=False, processes=None, server_config=None):
                 "routing": {"defaultRoutingGroup": "cell"},
                 "transactionAwareness": {"enabled": True, "identityKey": key, "adminToken": token, "terminalRetentionSeconds": 1},
             }
+            if pool is not None:
+                config["transactionAwareness"]["pool"] = pool
             config["serverConfig"].update(server_config or {})
             if form_auth:
                 auth = Path(__file__).resolve().parents[2] / "gateway-ha/src/test/resources/auth"

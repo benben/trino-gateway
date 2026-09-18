@@ -529,9 +529,15 @@ class TestPoolStore
                 guard("op-p1", "principals"),
                 "rev-1",
                 List.of("warehouse-one", "warehouse-one.alice", "warehouse-one.bob"));
-        assertThat(published.principals()).containsExactly("warehouse-one", "warehouse-one.alice", "warehouse-one.bob");
+        // A write result is recorded as an idempotent step, so it echoes the count and digest rather
+        // than the set; the read path returns the set itself.
+        assertThat(published.principalCount()).isEqualTo(3);
+        assertThat(published.principals()).isEmpty();
         assertThat(published.principalRevision()).isEqualTo("rev-1");
         assertThat(published.state()).isEqualTo("PENDING");
+        assertThat(first.tenantAdmission(POOL, "org-1").orElseThrow().principals())
+                .containsExactly("warehouse-one", "warehouse-one.alice", "warehouse-one.bob");
+        assertThat(first.tenantAdmission(POOL, "org-1").orElseThrow().principalsHash()).isEqualTo(published.principalsHash());
 
         // Republishing replaces the set: a removed login stops being dispatchable.
         PoolStore.TenantAdmission replaced = first.publishTenantPrincipals(
@@ -540,7 +546,7 @@ class TestPoolStore
                 guard("op-p2", "principals"),
                 "rev-2",
                 List.of("warehouse-one", "warehouse-one.alice"));
-        assertThat(replaced.principals()).containsExactly("warehouse-one", "warehouse-one.alice");
+        assertThat(replaced.principalCount()).isEqualTo(2);
         assertThat(replaced.principalRevision()).isEqualTo("rev-2");
         assertThat(second.tenantAdmission(POOL, "org-1").orElseThrow().principals())
                 .containsExactly("warehouse-one", "warehouse-one.alice");
@@ -560,6 +566,71 @@ class TestPoolStore
         PoolStore.TenantAdmission admission = first.tenantAdmission(POOL, "1f3a9c27-org").orElseThrow();
         assertThat(admission.tenant()).isEqualTo("1f3a9c27-org");
         assertThat(admission.principals()).containsExactly("warehouse-nine", "warehouse-nine.alice");
+    }
+
+    @Test
+    void aLargePrincipalSetIsPublishedWithoutHoldingThePoolLockPerPrincipal()
+    {
+        // The publication holds the same pool row lock that every query admission takes, so the number
+        // of round trips must not grow with the tenant's login count. A realistic warehouse has one
+        // bare login plus one per user.
+        List<String> principals = new java.util.ArrayList<>();
+        for (int warehouse = 0; warehouse < 500; warehouse++) {
+            principals.add("warehouse-" + warehouse);
+            for (int user = 0; user < 9; user++) {
+                principals.add("warehouse-" + warehouse + ".user-" + user);
+            }
+        }
+        // A duplicate must not become a second insert of the same key in one statement.
+        principals.add("warehouse-0");
+        assertThat(principals).hasSize(5001);
+
+        java.util.List<String> executed = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        database.getConfig(org.jdbi.v3.core.statement.SqlStatements.class).setSqlLogger(
+                new org.jdbi.v3.core.statement.SqlLogger()
+                {
+                    @Override
+                    public void logAfterExecution(org.jdbi.v3.core.statement.StatementContext context)
+                    {
+                        executed.add(context.getRenderedSql() == null ? "" : context.getRenderedSql());
+                    }
+                });
+        PoolStore.TenantAdmission published;
+        try {
+            published = first.publishTenantPrincipals(POOL, "org-1", guard("op-p1", "principals"), "rev-1", principals);
+        }
+        finally {
+            database.getConfig(org.jdbi.v3.core.statement.SqlStatements.class)
+                    .setSqlLogger(org.jdbi.v3.core.statement.SqlLogger.NOP_SQL_LOGGER);
+        }
+
+        long inserts = executed.stream().filter(sql -> sql.contains("INSERT INTO pool_tenant_principal")).count();
+        assertThat(inserts).isEqualTo(1);
+        // The whole publication, lock acquisition and read-back included, stays a fixed statement count.
+        assertThat(executed).hasSizeLessThan(16);
+        assertThat(published.principalCount()).isEqualTo(5000);
+        assertThat(published.principalRevision()).isEqualTo("rev-1");
+        // The recorded step result must stay bounded, so the write echoes a digest and the read path
+        // returns the set. Both describe the same published mapping.
+        PoolStore.TenantAdmission read = second.tenantAdmission(POOL, "org-1").orElseThrow();
+        assertThat(read.principals()).hasSize(5000).contains("warehouse-0", "warehouse-499.user-8");
+        assertThat(read.principalsHash()).isEqualTo(published.principalsHash());
+        // Replaying the publication resolves from the recorded step instead of failing on its size.
+        PoolStore.TenantAdmission replayed = second.publishTenantPrincipals(
+                POOL, "org-1", guard("op-p1", "principals"), "rev-1", principals);
+        assertThat(replayed.replayed()).isTrue();
+        assertThat(replayed.principalsHash()).isEqualTo(published.principalsHash());
+
+        // Replacement semantics are unchanged at this size: removed logins disappear, kept ones take the
+        // new revision, and the set is exactly what was published last.
+        PoolStore.TenantAdmission replaced = first.publishTenantPrincipals(
+                POOL, "org-1", guard("op-p2", "principals"), "rev-2", List.of("warehouse-0", "warehouse-0.user-0", "warehouse-new"));
+        assertThat(replaced.principalCount()).isEqualTo(3);
+        assertThat(replaced.principalRevision()).isEqualTo("rev-2");
+        assertThat(second.tenantAdmission(POOL, "org-1").orElseThrow().principals())
+                .containsExactly("warehouse-0", "warehouse-0.user-0", "warehouse-new");
+        // Publishing a set never admits the tenant.
+        assertThat(replaced.state()).isEqualTo("PENDING");
     }
 
     @Test

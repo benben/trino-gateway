@@ -115,7 +115,7 @@ public class TransactionAwarenessService
     public TransactionAwarenessService(HaGatewayConfiguration configuration, Jdbi jdbi, GatewayBackendManager backendManager, @ForMonitor HttpClient httpClient, RoutingGroupSelector routingGroupSelector)
     {
         config = configuration.getTransactionAwareness();
-        config.validate(configuration.getDataStore());
+        config.validate(configuration.getDataStore(), configuration.getRouting());
         store = new TransactionStore(jdbi);
         rollouts = new RolloutStore(jdbi);
         pools = new PoolStore(jdbi);
