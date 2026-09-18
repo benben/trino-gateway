@@ -1505,7 +1505,10 @@ public final class PoolStore
         Summary summary = handle.createQuery(
                         """
                         SELECT min(revision) AS revision, count(*) AS principal_count,
-                          encode(sha256(coalesce(string_agg(principal, E'\\n' ORDER BY principal), '')::bytea), 'hex') AS principals_hash
+                          -- convert_to, never a cast: casting text to bytea interprets backslash
+                          -- escapes, so a permitted principal containing a backslash would fail the
+                          -- whole publication instead of being digested as the bytes it is.
+                          encode(sha256(convert_to(coalesce(string_agg(principal, E'\\n' ORDER BY principal), ''), 'UTF8')), 'hex') AS principals_hash
                         FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant
                         """)
                 .bind("pool", poolId).bind("tenant", tenant)

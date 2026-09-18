@@ -634,6 +634,30 @@ class TestPoolStore
     }
 
     @Test
+    void aPrincipalWithABackslashOrNonAsciiBytesIsPublishedAndDigestedExactly()
+    {
+        // The coordinator's password store may legitimately hold either, so the digest must encode the
+        // principal's bytes rather than interpret them. Escape-interpreting the text would fail the
+        // whole publication for one permitted name.
+        List<String> principals = List.of("alice\\smith", "domain\\\\user", "björn.müller", "warehouse-one");
+        PoolStore.TenantAdmission published = first.publishTenantPrincipals(
+                POOL, "org-1", guard("op-p1", "principals"), "rev-1", principals);
+        assertThat(published.principalCount()).isEqualTo(4);
+        assertThat(published.principalsHash()).hasSize(64);
+        // The stored names keep their exact bytes.
+        assertThat(second.tenantAdmission(POOL, "org-1").orElseThrow().principals())
+                .containsExactlyInAnyOrderElementsOf(principals);
+        // The digest is over the sorted names joined by a newline, encoded as UTF-8.
+        String expected = database.withHandle(handle -> handle.createQuery(
+                        "SELECT encode(sha256(convert_to(:joined, 'UTF8')), 'hex')")
+                .bind("joined", String.join("\n", principals.stream().sorted().toList()))
+                .mapTo(String.class).one());
+        assertThat(published.principalsHash()).isEqualTo(expected);
+        // A read of an unrelated tenant is unaffected and reports no digest at all.
+        assertThat(first.tenantAdmission(POOL, "org-2")).isEmpty();
+    }
+
+    @Test
     void aPrincipalCannotBelongToTwoTenantsOfOnePool()
     {
         first.publishTenantPrincipals(POOL, "org-1", guard("op-p1", "principals"), "rev-1", List.of("warehouse-one"));
