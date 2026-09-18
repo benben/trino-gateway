@@ -29,6 +29,17 @@ public class TransactionAwarenessConfiguration
     private int requestTimeoutMillis = 120000;
     private int processInfoTimeoutMillis = 5000;
     private int completionTimeoutMillis = 10000;
+    private PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+
+    public PoolLifecycleConfiguration getPool()
+    {
+        return pool;
+    }
+
+    public void setPool(PoolLifecycleConfiguration pool)
+    {
+        this.pool = pool == null ? new PoolLifecycleConfiguration() : pool;
+    }
 
     public int getMaxInFlightRequests()
     {
@@ -124,6 +135,7 @@ public class TransactionAwarenessConfiguration
 
     public void validate(DataStoreConfiguration dataStore)
     {
+        pool.validate(enabled);
         if (!enabled) {
             return;
         }
