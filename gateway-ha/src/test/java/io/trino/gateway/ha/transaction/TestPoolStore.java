@@ -48,6 +48,7 @@ import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_MEMBE
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_NOT_CERTIFIED;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_NOT_DRAINED;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PHASE;
+import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PRINCIPAL_CONFLICT;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PUBLICATION_BARRIER;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_RECEIPTS_INCOMPLETE;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_REPAIR_BUDGET;
@@ -55,6 +56,7 @@ import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_SERVI
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_STALE_EPOCH;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_STALE_GENERATION;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_SURGE_BUDGET;
+import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_VALIDATION;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.TENANT_IDENTITY_UNVERIFIED;
 import static io.trino.gateway.ha.util.TestcontainersUtils.createPostgreSqlContainer;
 import static java.util.Objects.requireNonNull;
@@ -116,6 +118,7 @@ class TestPoolStore
         for (String version : new String[] {
                 "V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql",
                 "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql",
+                "V11__pool_tenant_principals.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -147,7 +150,7 @@ class TestPoolStore
     {
         database.useHandle(handle -> handle.execute(
                 """
-                TRUNCATE pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
+                TRUNCATE pool_tenant_principal, pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
                   pool_member_certificate, pool_operation, pool, transaction_rollout, transaction_route,
                   transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend
                 """));
@@ -444,6 +447,151 @@ class TestPoolStore
         assertThat(first.poolState(POOL).orElseThrow().controllerEpoch()).isEqualTo(epoch + 1);
         assertThatThrownBy(() -> first.registerMember(POOL, new Guard("op-old-owner", "register", epoch, PLAN_HASH, "controller-a"), registration("i-2")))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_EPOCH));
+    }
+
+    @Test
+    void aRecordedStepResolvesAfterAnotherControllerTakesAuthority()
+    {
+        // The intent hash excludes the authority envelope on purpose, so the next leader reissuing the
+        // same step resolves what its predecessor committed instead of conflicting with it forever.
+        Member member = first.registerMember(POOL, new Guard("op-resume", "register", epoch, PLAN_HASH, "controller-a"), registration("i-1"));
+        epoch = epoch + 1;
+        second.configurePool(
+                POOL,
+                new Guard("op-takeover", "configure", epoch, PLAN_HASH, "controller-b"),
+                new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false),
+                false);
+
+        Member replay = second.registerMember(POOL, new Guard("op-resume", "register", epoch, PLAN_HASH, "controller-b"), registration("i-1"));
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.incarnation()).isEqualTo(member.incarnation());
+        assertThat(first.members(POOL)).hasSize(1);
+
+        // The old controller can still read back its own committed step, but cannot apply anything new.
+        Member staleReplay = first.registerMember(POOL, new Guard("op-resume", "register", epoch - 1, PLAN_HASH, "controller-a"), registration("i-1"));
+        assertThat(staleReplay.replayed()).isTrue();
+        assertThatThrownBy(() -> first.registerMember(POOL, new Guard("op-stale-new", "register", epoch - 1, PLAN_HASH, "controller-a"), registration("i-2")))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_EPOCH));
+        // A changed intent under a recorded step identity is still a conflict, whoever presents it.
+        assertThatThrownBy(() -> second.registerMember(POOL, new Guard("op-resume", "register", epoch, "d".repeat(64), "controller-b"), registration("i-3")))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_INTENT_CHANGED));
+    }
+
+    @Test
+    void aConfigurationStepResolvesOnlyForTheAuthorityThatRecordedIt()
+    {
+        first.configurePool(
+                POOL,
+                new Guard("op-cfg", "configure", epoch, PLAN_HASH, "controller-a"),
+                new PoolSpec("POOLED", 2, 3, 1, 1, "r-1", false),
+                false);
+        assertThat(first.poolState(POOL).orElseThrow().minServing()).isEqualTo(2);
+
+        // The same controller retrying its own call resolves to the recorded result.
+        PoolStore.PoolState replay = first.configurePool(
+                POOL,
+                new Guard("op-cfg", "configure", epoch, PLAN_HASH, "controller-a"),
+                new PoolSpec("POOLED", 2, 3, 1, 1, "r-1", false),
+                false);
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.controllerEpoch()).isEqualTo(epoch);
+
+        // Reissued under a different authority it must NOT resolve: returning the earlier result would
+        // report an epoch that was never acquired. Taking authority needs its own step identity.
+        assertThatThrownBy(() -> second.configurePool(
+                POOL,
+                new Guard("op-cfg", "configure", epoch + 5, PLAN_HASH, "controller-b"),
+                new PoolSpec("POOLED", 2, 3, 1, 1, "r-1", false),
+                false))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_INTENT_CHANGED));
+        assertThat(first.poolState(POOL).orElseThrow().controllerEpoch()).isEqualTo(epoch);
+
+        // With its own step identity the takeover applies, and the new epoch is real.
+        PoolStore.PoolState taken = second.configurePool(
+                POOL,
+                new Guard("op-cfg-takeover", "configure", epoch + 5, PLAN_HASH, "controller-b"),
+                new PoolSpec("POOLED", 2, 3, 1, 1, "r-1", false),
+                false);
+        assertThat(taken.replayed()).isFalse();
+        assertThat(taken.controllerEpoch()).isEqualTo(epoch + 5);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Authoritative principal mapping
+    // --------------------------------------------------------------------------------------------
+
+    @Test
+    void aTenantsPrincipalSetIsPublishedWholeAndReadBack()
+    {
+        PoolStore.TenantAdmission published = first.publishTenantPrincipals(
+                POOL,
+                "org-1",
+                guard("op-p1", "principals"),
+                "rev-1",
+                List.of("warehouse-one", "warehouse-one.alice", "warehouse-one.bob"));
+        assertThat(published.principals()).containsExactly("warehouse-one", "warehouse-one.alice", "warehouse-one.bob");
+        assertThat(published.principalRevision()).isEqualTo("rev-1");
+        assertThat(published.state()).isEqualTo("PENDING");
+
+        // Republishing replaces the set: a removed login stops being dispatchable.
+        PoolStore.TenantAdmission replaced = first.publishTenantPrincipals(
+                POOL,
+                "org-1",
+                guard("op-p2", "principals"),
+                "rev-2",
+                List.of("warehouse-one", "warehouse-one.alice"));
+        assertThat(replaced.principals()).containsExactly("warehouse-one", "warehouse-one.alice");
+        assertThat(replaced.principalRevision()).isEqualTo("rev-2");
+        assertThat(second.tenantAdmission(POOL, "org-1").orElseThrow().principals())
+                .containsExactly("warehouse-one", "warehouse-one.alice");
+    }
+
+    @Test
+    void aTenantIdentifierUnrelatedToItsWarehouseNameIsHonoured()
+    {
+        // The tenant key is the controller's own identifier. It is not a prefix of any principal, and a
+        // principal's leading label is not the tenant, so only the published mapping connects them.
+        first.publishTenantPrincipals(
+                POOL,
+                "1f3a9c27-org",
+                guard("op-p1", "principals"),
+                "rev-1",
+                List.of("warehouse-nine", "warehouse-nine.alice"));
+        PoolStore.TenantAdmission admission = first.tenantAdmission(POOL, "1f3a9c27-org").orElseThrow();
+        assertThat(admission.tenant()).isEqualTo("1f3a9c27-org");
+        assertThat(admission.principals()).containsExactly("warehouse-nine", "warehouse-nine.alice");
+    }
+
+    @Test
+    void aPrincipalCannotBelongToTwoTenantsOfOnePool()
+    {
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-p1", "principals"), "rev-1", List.of("warehouse-one"));
+        assertThatThrownBy(() -> first.publishTenantPrincipals(POOL, "org-2", guard("op-p2", "principals"), "rev-1", List.of("warehouse-one")))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PRINCIPAL_CONFLICT));
+        assertThat(first.tenantAdmission(POOL, "org-1").orElseThrow().principals()).containsExactly("warehouse-one");
+    }
+
+    @Test
+    void aPrincipalThatCouldNotReachAPasswordFileIsRefused()
+    {
+        // A name with a credential separator or a control character could never be projected into the
+        // coordinator's password file, so publishing it would bind a principal that cannot authenticate.
+        assertThatThrownBy(() -> first.publishTenantPrincipals(
+                POOL,
+                "org-1",
+                guard("op-p1", "principals"),
+                "rev-1",
+                List.of("warehouse-one:injected")))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
+        assertThatThrownBy(() -> first.publishTenantPrincipals(
+                POOL,
+                "org-1",
+                guard("op-p2", "principals"),
+                "rev-1",
+                List.of("warehouse-one\nroot")))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
+        assertThatThrownBy(() -> first.publishTenantPrincipals(POOL, "org-1", guard("op-p3", "principals"), "rev-1", List.of()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
     }
 
     @Test

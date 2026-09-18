@@ -44,6 +44,7 @@ import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_NOT_C
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_NOT_DRAINED;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_NOT_FOUND;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PHASE;
+import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PRINCIPAL_CONFLICT;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_PUBLICATION_BARRIER;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_RECEIPTS_INCOMPLETE;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_REPAIR_BUDGET;
@@ -117,6 +118,7 @@ public final class PoolStore
         POOL_RECEIPTS_INCOMPLETE(409),
         POOL_EVIDENCE_REQUIRED(409),
         POOL_IDENTITY_CONFLICT(409),
+        POOL_PRINCIPAL_CONFLICT(409),
         POOL_VALIDATION(400),
         TENANT_IDENTITY_UNVERIFIED(409);
 
@@ -332,7 +334,15 @@ public final class PoolStore
             String state,
             @Nullable String admittedRevision,
             @Nullable String publicationId,
-            boolean replayed) {}
+            @Nullable String principalRevision,
+            List<String> principals,
+            boolean replayed)
+    {
+        public TenantAdmission
+        {
+            principals = principals == null ? List.of() : List.copyOf(principals);
+        }
+    }
 
     @JsonInclude(JsonInclude.Include.ALWAYS)
     public record OperationStep(String stepId, String payloadHash, long controllerEpoch, String outcome, String recordedAt, JsonNode result) {}
@@ -369,6 +379,13 @@ public final class PoolStore
             TransactionStore.lockRoute(handle, poolId);
             ensurePoolRow(handle, poolId);
             Row pool = lockedPool(handle, poolId);
+            // A recorded outcome is resolved first and applies nothing. For this call the recorded
+            // authority must match: returning an earlier result to a controller presenting a different
+            // epoch would report an authority it never acquired.
+            Optional<JsonNode> replay = recordedStep(handle, poolId, guard, true);
+            if (replay.isPresent()) {
+                return decode(replay.orElseThrow(), PoolState.class, true);
+            }
             check(guard.controllerEpoch() >= pool.epoch, POOL_STALE_EPOCH, "controllerEpoch is behind the recorded authority epoch");
             // Takeover is explicit: a controller that is not the recorded owner must raise the epoch.
             // An equal epoch presented by a different, or unidentified, controller is refused, so two
@@ -376,10 +393,6 @@ public final class PoolStore
             check(pool.ownerIdentity == null || Objects.equals(pool.ownerIdentity, guard.ownerIdentity()) || guard.controllerEpoch() > pool.epoch,
                     POOL_STALE_EPOCH,
                     "Taking authority from another controller requires a strictly greater epoch");
-            Optional<JsonNode> replay = recordedStep(handle, poolId, guard);
-            if (replay.isPresent()) {
-                return decode(replay.orElseThrow(), PoolState.class, true);
-            }
             if (spec.apiMode().equals("LEGACY")) {
                 check(countMembers(handle, poolId, LIVE_PHASES) == 0, POOL_APIMODE, "A pool with live members cannot return to LEGACY mode");
             }
@@ -854,6 +867,67 @@ public final class PoolStore
         });
     }
 
+    /**
+     * Publishes a tenant's authoritative principal set.
+     * <p>
+     * The restriction keys on the exact principal the coordinator authenticates. A tenant's logins are
+     * one flat namespace produced by the controller's own projection, including a root login that
+     * carries no separator, and they are not a function of the tenant identifier, so the Gateway must
+     * be told them rather than deriving them. The set is replaced whole under the pool lock, and a
+     * principal already bound to another tenant is a conflict rather than an ambiguous admission.
+     */
+    public TenantAdmission publishTenantPrincipals(String poolId, String tenant, Guard guard, String revision, List<String> principals)
+    {
+        validateTenant(tenant);
+        check(revision != null && revision.matches("[A-Za-z0-9_.:-]{1,64}"), POOL_VALIDATION, "revision is invalid");
+        check(principals != null && !principals.isEmpty() && principals.size() <= 10000, POOL_VALIDATION, "principals are required");
+        principals.forEach(principal -> check(
+                principal != null && !principal.isBlank() && principal.length() <= 512
+                        && principal.codePoints().noneMatch(Character::isISOControl) && principal.indexOf(':') < 0,
+                POOL_VALIDATION,
+                "A principal must be a single-line name without a credential separator"));
+        List<String> ordered = principals.stream().distinct().sorted().toList();
+        return inPool(poolId, guard, TenantAdmission.class, (handle, pool) -> {
+            requirePooled(pool);
+            List<String> contested = handle.createQuery(
+                            """
+                            SELECT principal FROM pool_tenant_principal
+                            WHERE pool_id = :pool AND tenant <> :tenant AND principal = ANY(:principals)
+                            ORDER BY principal
+                            """)
+                    .bind("pool", poolId).bind("tenant", tenant)
+                    .bindArray("principals", String.class, ordered.toArray(String[]::new))
+                    .mapTo(String.class).list();
+            check(contested.isEmpty(), POOL_PRINCIPAL_CONFLICT, "A published principal already belongs to another tenant");
+            handle.createUpdate(
+                            """
+                            DELETE FROM pool_tenant_principal
+                            WHERE pool_id = :pool AND tenant = :tenant AND NOT (principal = ANY(:principals))
+                            """)
+                    .bind("pool", poolId).bind("tenant", tenant)
+                    .bindArray("principals", String.class, ordered.toArray(String[]::new))
+                    .execute();
+            for (String principal : ordered) {
+                handle.createUpdate(
+                                """
+                                INSERT INTO pool_tenant_principal (pool_id, principal, tenant, revision)
+                                VALUES (:pool, :principal, :tenant, :revision)
+                                ON CONFLICT (pool_id, principal) DO UPDATE SET tenant = EXCLUDED.tenant,
+                                  revision = EXCLUDED.revision, updated_at = clock_timestamp()
+                                """)
+                        .bind("pool", poolId).bind("principal", principal).bind("tenant", tenant).bind("revision", revision)
+                        .execute();
+            }
+            handle.createUpdate(
+                            """
+                            INSERT INTO pool_tenant_admission (pool_id, tenant, state) VALUES (:pool, :tenant, 'PENDING')
+                            ON CONFLICT (pool_id, tenant) DO NOTHING
+                            """)
+                    .bind("pool", poolId).bind("tenant", tenant).execute();
+            return tenantAdmission(handle, poolId, tenant, false);
+        });
+    }
+
     public TenantAdmission revokeTenant(String poolId, String tenant, Guard guard, String reason)
     {
         validateTenant(tenant);
@@ -971,23 +1045,55 @@ public final class PoolStore
     }
 
     /**
+     * Whether this routing group is pooled, and if so its ACTIVE members, read in one round trip.
+     * <p>
+     * One statement answers both questions so the request path does not pay two reads to discover
+     * that a routing group is legacy. The result is a snapshot and is treated as advisory: the
+     * admission itself re-validates the pool mode and the member's phase under the pool's share lock,
+     * so a mode or phase change that races this read cannot admit work to an ineligible member. No
+     * cross-replica cache is introduced, and no result is reused across requests.
+     */
+    public PoolRouting routing(String poolId)
+    {
+        return jdbi.withHandle(handle -> {
+            List<Candidate> candidates = new ArrayList<>();
+            boolean[] pooled = {false};
+            handle.createQuery(
+                            """
+                            SELECT p.api_mode, b.current_name, b.incarnation, b.instance_id, b.backend_url
+                            FROM pool p
+                            LEFT JOIN transaction_backend b
+                              ON b.pool_id = p.pool_id AND b.state = 'ACTIVE' AND b.current_name IS NOT NULL
+                            WHERE p.pool_id = :pool
+                            """).bind("pool", poolId)
+                    .map((rs, _) -> {
+                        pooled[0] = "POOLED".equals(rs.getString("api_mode"));
+                        String name = rs.getString("current_name");
+                        return name == null
+                                ? Optional.<Candidate>empty()
+                                : Optional.of(new Candidate(
+                                name,
+                                rs.getObject("incarnation", UUID.class),
+                                rs.getString("instance_id"),
+                                rs.getString("backend_url")));
+                    })
+                    .forEach(candidate -> candidate.ifPresent(candidates::add));
+            return new PoolRouting(pooled[0], pooled[0] ? List.copyOf(candidates) : List.of());
+        });
+    }
+
+    /**
+     * An advisory routing snapshot: pool mode plus the members that were ACTIVE when it was read.
+     */
+    public record PoolRouting(boolean pooled, List<Candidate> candidates) {}
+
+    /**
      * Candidates that are ACTIVE in the authoritative store. Cached health may only order these, and
      * the admission itself re-validates the phase under the pool's share lock.
      */
     public List<Candidate> eligibleCandidates(String poolId)
     {
-        return jdbi.withHandle(handle -> handle.createQuery(
-                        """
-                        SELECT b.current_name, b.incarnation, b.instance_id, b.backend_url
-                        FROM transaction_backend b JOIN pool p ON p.pool_id = b.pool_id
-                        WHERE b.pool_id = :pool AND b.state = 'ACTIVE' AND p.api_mode = 'POOLED' AND b.current_name IS NOT NULL
-                        """).bind("pool", poolId)
-                .map((rs, _) -> new Candidate(
-                        rs.getString("current_name"),
-                        rs.getObject("incarnation", UUID.class),
-                        rs.getString("instance_id"),
-                        rs.getString("backend_url")))
-                .list());
+        return routing(poolId).candidates();
     }
 
     /**
@@ -995,8 +1101,7 @@ public final class PoolStore
      */
     public boolean isPooled(String poolId)
     {
-        return jdbi.withHandle(handle -> handle.createQuery("SELECT api_mode = 'POOLED' FROM pool WHERE pool_id = :pool")
-                .bind("pool", poolId).mapTo(Boolean.class).findOne().orElse(false));
+        return routing(poolId).pooled();
     }
 
     /**
@@ -1031,14 +1136,21 @@ public final class PoolStore
             TransactionStore.lockRoute(handle, poolId);
             Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
             lockedPool(handle, poolId);
-            check(guard.controllerEpoch() == pool.epoch, POOL_STALE_EPOCH, "controllerEpoch does not match the recorded authority epoch");
-            check(pool.ownerIdentity == null || guard.ownerIdentity() == null || Objects.equals(pool.ownerIdentity, guard.ownerIdentity()),
-                    POOL_STALE_EPOCH,
-                    "This controller identity does not hold the pool authority");
+            // An already recorded outcome is resolved before the authority fence, and applies nothing.
+            // Otherwise a step committed by a previous leader could never be read back after a takeover
+            // raised the epoch, and the operation it belongs to could not be resumed. Reading back a
+            // committed result is not a new effect, so it needs no current authority.
             Optional<JsonNode> replay = recordedStep(handle, poolId, guard);
             if (replay.isPresent()) {
                 return decode(replay.orElseThrow(), resultType, true);
             }
+            check(guard.controllerEpoch() == pool.epoch, POOL_STALE_EPOCH, "controllerEpoch does not match the recorded authority epoch");
+            // Once a pool has a recorded owner, presenting it is mandatory: an omitted identity would
+            // otherwise be a fallback that any equal-epoch caller could use to bypass the fence. A pool
+            // that has never recorded an owner stays compatible with a client that does not send one.
+            check(pool.ownerIdentity == null || Objects.equals(pool.ownerIdentity, guard.ownerIdentity()),
+                    POOL_STALE_EPOCH,
+                    "This controller identity does not hold the pool authority");
             T result = action.apply(handle, pool);
             recordStep(handle, poolId, guard, result);
             return result;
@@ -1047,17 +1159,34 @@ public final class PoolStore
 
     private Optional<JsonNode> recordedStep(Handle handle, String poolId, Guard guard)
     {
+        return recordedStep(handle, poolId, guard, false);
+    }
+
+    /**
+     * @param authorityMustMatch for a step whose purpose is to hold or take authority. Such a step only
+     *         resolves to its recorded result for the same authority that recorded it: replaying it to
+     *         a different epoch would report an authority the caller never acquired. Ordinary effects
+     *         resolve regardless of the presented epoch, which is what lets the next leader resume
+     *         work its predecessor already committed.
+     */
+    private Optional<JsonNode> recordedStep(Handle handle, String poolId, Guard guard, boolean authorityMustMatch)
+    {
+        record Recorded(String payloadHash, long epoch, String result) {}
+
         return handle.createQuery(
                         """
-                        SELECT payload_hash, result::text AS result FROM pool_operation
+                        SELECT payload_hash, epoch, result::text AS result FROM pool_operation
                         WHERE pool_id = :pool AND operation_id = :operation AND step_id = :step FOR UPDATE
                         """)
                 .bind("pool", poolId).bind("operation", guard.operationId()).bind("step", guard.stepId())
-                .map((rs, _) -> Map.entry(rs.getString("payload_hash"), rs.getString("result")))
+                .map((rs, _) -> new Recorded(rs.getString("payload_hash"), rs.getLong("epoch"), rs.getString("result")))
                 .findOne()
-                .map(entry -> {
-                    check(entry.getKey().equals(guard.payloadHash()), POOL_INTENT_CHANGED, "This operation step was recorded with a different intent");
-                    return readTree(entry.getValue());
+                .map(recorded -> {
+                    check(recorded.payloadHash().equals(guard.payloadHash()), POOL_INTENT_CHANGED, "This operation step was recorded with a different intent");
+                    check(!authorityMustMatch || recorded.epoch() == guard.controllerEpoch(),
+                            POOL_INTENT_CHANGED,
+                            "This step recorded a different authority; acquiring authority needs its own step identity");
+                    return readTree(recorded.result());
                 });
     }
 
@@ -1341,6 +1470,12 @@ public final class PoolStore
 
     private static TenantAdmission tenantAdmission(Handle handle, String poolId, String tenant, boolean replayed)
     {
+        List<String> principals = handle.createQuery(
+                        "SELECT principal FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant ORDER BY principal")
+                .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).list();
+        String revision = handle.createQuery(
+                        "SELECT DISTINCT revision FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant")
+                .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).findFirst().orElse(null);
         return handle.createQuery("SELECT state, admitted_revision, publication_id FROM pool_tenant_admission WHERE pool_id = :pool AND tenant = :tenant")
                 .bind("pool", poolId).bind("tenant", tenant)
                 .map((rs, _) -> new TenantAdmission(
@@ -1350,9 +1485,11 @@ public final class PoolStore
                         rs.getString("state"),
                         rs.getString("admitted_revision"),
                         rs.getString("publication_id"),
+                        revision,
+                        principals,
                         replayed))
                 .findOne()
-                .orElseGet(() -> new TenantAdmission(PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, replayed));
+                .orElseGet(() -> new TenantAdmission(PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, revision, principals, replayed));
     }
 
     /**
@@ -1751,6 +1888,8 @@ public final class PoolStore
                     admission.state(),
                     admission.admittedRevision(),
                     admission.publicationId(),
+                    admission.principalRevision(),
+                    admission.principals(),
                     true);
             default -> Function.identity();
         };

@@ -60,7 +60,18 @@ public final class TransactionStore
         return new TransactionStore(jdbi, requireNonNull(operation, "operation is null"));
     }
 
-    public record BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId) {}
+    /**
+     * @param poolId set when this backend is a pooled member. It records which transport a probe of
+     *         this backend must describe, so a pooled member reached over internal HTTP is probed
+     *         differently from a legacy backend without an extra read to find that out.
+     */
+    public record BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId, @Nullable String poolId)
+    {
+        public BackendRef(String name, UUID incarnation, String url, String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId)
+        {
+            this(name, incarnation, url, externalUrl, routingGroup, nodeId, coordinatorId, null);
+        }
+    }
 
     public record Admission(UUID id, BackendRef backend, String ownerHash, @Nullable String transactionId, @Nullable String queryId) {}
 
@@ -167,10 +178,11 @@ public final class TransactionStore
      * boundary where eligibility and lifecycle transitions serialize against each other.
      */
     /**
-     * The tenant names a request could execute as, evaluated against the pool's admission record in
-     * the same transaction as the admission itself. Empty candidates with an enabled gate are refused.
+     * The one principal a request will be authenticated as, resolved to its tenant through the
+     * controller-published mapping in the same transaction as the admission itself. No principal, or a
+     * principal the mapping does not name, is refused: the restriction fails closed.
      */
-    public record TenantGate(java.util.Set<String> tenants) {}
+    public record TenantGate(@Nullable String principal) {}
 
     public Admission admitPooledMember(String poolId, String backendName, String ownerHash)
     {
@@ -688,7 +700,8 @@ public final class TransactionStore
                 rs.getString("external_url"),
                 rs.getString("routing_group"),
                 rs.getString("node_id"),
-                rs.getString("coordinator_id"));
+                rs.getString("coordinator_id"),
+                rs.getString("pool_id"));
     }
 
     private static String backendState(Handle handle, BackendRef backend)
@@ -721,20 +734,29 @@ public final class TransactionStore
         if (!enabled) {
             return;
         }
-        check(gate != null && !gate.tenants().isEmpty(), ErrorCode.TENANT_NOT_ADMITTED, "The request names no admitted tenant");
-        // Every candidate tenant must be admitted, not merely the ones that happen to have a record:
-        // an unknown tenant fails closed, so a second identity header cannot name an unpublished
-        // tenant and still pass. A caller can only ever lose access this way, never gain it.
-        long admitted = handle.createQuery(
+        check(gate != null && gate.principal() != null, ErrorCode.TENANT_NOT_ADMITTED, "The request presents no credential to restrict");
+        // Exactly the one principal the coordinator will authenticate is resolved. Its tenant comes
+        // from the published mapping, never from the shape of the name: a tenant's logins include a
+        // root name with no separator, and the tenant identifier is not a prefix of them.
+        //
+        // An unmapped principal is unknown and fails closed. It must not fall back to any other name:
+        // the coordinator qualifies before authenticating and checks only the qualified name, so an
+        // unrelated mapping for the name as typed says nothing about this request.
+        Optional<String> state = handle.createQuery(
                         """
-                        SELECT count(*) FROM pool_tenant_admission
-                        WHERE pool_id = :pool AND tenant = ANY(:tenants) AND state = 'ADMITTED'
+                        SELECT coalesce(a.state, 'PENDING') AS state
+                        FROM pool_tenant_principal p
+                        LEFT JOIN pool_tenant_admission a ON a.pool_id = p.pool_id AND a.tenant = p.tenant
+                        WHERE p.pool_id = :pool AND p.principal = :principal
                         """)
-                .bind("pool", poolId).bindArray("tenants", String.class, gate.tenants().toArray(String[]::new))
-                .mapTo(Long.class).one();
-        check(admitted == gate.tenants().size(),
+                .bind("pool", poolId).bind("principal", gate.principal())
+                .mapTo(String.class).findOne();
+        check(state.isPresent(), ErrorCode.TENANT_NOT_ADMITTED, "This principal is not published for any tenant of this pool");
+        // A caller can only ever lose access this way, never gain it: the coordinator still verifies
+        // the credential itself and its policy still authorizes the query.
+        check(state.orElseThrow().equals("ADMITTED"),
                 ErrorCode.TENANT_NOT_ADMITTED,
-                "The request names a tenant that is not admitted");
+                "This principal belongs to a tenant that is not admitted");
     }
 
     static boolean isPooledMode(Handle handle, String routingGroup)

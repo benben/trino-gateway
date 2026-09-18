@@ -21,6 +21,8 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
@@ -32,141 +34,183 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * The restriction's key must be the same string the coordinator authenticates. These assertions pin
- * the parsing rules that equality depends on.
+ * The restriction's lookup key must be a name the coordinator could actually authenticate. These
+ * assertions pin the parsing and qualification rules; which tenant a name belongs to is not decided
+ * here at all, it comes from the controller-published mapping.
  */
 class TestTenantPrincipals
 {
     private static final String DOMAIN = "dw.example.test";
+    private static final List<String> DOMAINS = List.of(DOMAIN);
+    private static final Set<String> EXCLUDED = Set.of("internal", "admin");
 
     @Test
-    void aHostQualifiedCredentialNamesItsWarehouseAsTheTenant()
+    void aCredentialSentToATenantHostIsQualifiedAndNothingElse()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "secret")), "Host", List.of("tenant-a." + DOMAIN))), DOMAIN);
-        assertThat(candidates.principals()).containsExactlyInAnyOrder("alice", "tenant-a.alice");
-        assertThat(candidates.tenants()).containsExactly("tenant-a");
+        // The coordinator qualifies before it authenticates and checks only this name. The name as
+        // typed is deliberately not an alternative: treating it as one would let a request whose
+        // qualified principal is unpublished pass on an unrelated mapping for the typed name.
+        assertThat(principal("alice", "warehouse-one." + DOMAIN)).contains("warehouse-one.alice");
     }
 
     @Test
-    void aBareCredentialAtTheApexHostNamesNoTenant()
+    void aCredentialAtTheApexHostYieldsOnlyItself()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "secret")), "Host", List.of(DOMAIN))), DOMAIN);
-        assertThat(candidates.principals()).containsExactly("alice");
-        assertThat(candidates.tenants()).isEmpty();
+        // A tenant's root login is its bare warehouse name, and at a host that does not qualify the
+        // coordinator authenticates it exactly as presented.
+        assertThat(principal("warehouse-one", DOMAIN)).contains("warehouse-one");
     }
 
     @Test
-    void aMultiLabelHostIsNotQualified()
+    void aMultiLabelHostDoesNotQualify()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "secret")), "Host", List.of("a.b." + DOMAIN))), DOMAIN);
-        assertThat(candidates.tenants()).isEmpty();
+        assertThat(principal("alice", "a.b." + DOMAIN)).contains("alice");
     }
 
     @Test
-    void anAlreadyQualifiedCredentialIsNotQualifiedTwice()
+    void aHostOutsideTheConfiguredDomainDoesNotQualify()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("tenant-a.alice", "secret")), "Host", List.of("tenant-b." + DOMAIN))), DOMAIN);
-        assertThat(candidates.principals()).containsExactly("tenant-a.alice");
-        assertThat(candidates.tenants()).containsExactly("tenant-a");
+        assertThat(principal("alice", "warehouse-one.other.test")).contains("alice");
     }
 
     @Test
-    void everyIdentityHeaderContributesACandidate()
+    void anExcludedHostLabelDoesNotQualify()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
+        // The coordinator excludes operational host names, so neither side reads them as a tenant.
+        assertThat(principal("alice", "internal." + DOMAIN)).contains("alice");
+        assertThat(principal("alice", "admin." + DOMAIN)).contains("alice");
+    }
+
+    @Test
+    void anAlreadyQualifiedCredentialIsQualifiedAgainExactlyAsTheCoordinatorWould()
+    {
+        // The coordinator prefixes whatever it was given, so the doubly qualified name is what it
+        // authenticates. Whether it is published is the mapping's business, not this class's.
+        assertThat(principal("warehouse-one.alice", "warehouse-two." + DOMAIN)).contains("warehouse-two.warehouse-one.alice");
+    }
+
+    @Test
+    void anInvalidHostLabelDoesNotQualify()
+    {
+        assertThat(principal("alice", "-nope." + DOMAIN)).contains("alice");
+        assertThat(principal("alice", "UPPER." + DOMAIN)).contains("upper.alice");
+    }
+
+    @Test
+    void aNestedDomainQualifiesUnderItsLongestMatchingSuffix()
+    {
+        // With both a domain and a nested domain configured, a host that is one label under the nested
+        // one qualifies there. The same host is two labels under the shorter suffix, which does not
+        // qualify, so the order the domains are configured in must not change the answer.
+        List<String> nested = List.of(DOMAIN, "cell." + DOMAIN);
+        assertThat(principal("alice", "warehouse-one.cell." + DOMAIN, nested)).contains("warehouse-one.alice");
+        assertThat(principal("alice", "warehouse-one.cell." + DOMAIN, List.of("cell." + DOMAIN, DOMAIN))).contains("warehouse-one.alice");
+        // A host directly under the shorter domain still qualifies there.
+        assertThat(principal("alice", "warehouse-one." + DOMAIN, nested)).contains("warehouse-one.alice");
+    }
+
+    @Test
+    void aTrailingDotAndAPortDoNotChangeTheCandidates()
+    {
+        assertThat(principal("alice", "warehouse-one." + DOMAIN + ".")).contains("warehouse-one.alice");
+        assertThat(principal("alice", "warehouse-one." + DOMAIN + ":8443")).contains("warehouse-one.alice");
+    }
+
+    @Test
+    void noConfiguredDomainLeavesTheCredentialAsTheOnlyCandidate()
+    {
+        assertThat(principal("alice", "warehouse-one." + DOMAIN, List.of())).contains("alice");
+    }
+
+    @Test
+    void aRequestUserHeaderIsNeverACandidate()
+    {
+        // A user header is not evidence of authentication. Selection and impersonation stay with the
+        // coordinator and its policy.
+        Optional<String> principal = TenantPrincipals.authenticatedPrincipal(
                 request(Map.of(
                         "Authorization", List.of(basic("alice", "secret")),
-                        "Host", List.of("tenant-a." + DOMAIN),
-                        "X-Trino-User", List.of("tenant-b.alice"),
-                        "X-Trino-Original-User", List.of("tenant-c.alice"))),
-                DOMAIN);
-        assertThat(candidates.tenants()).containsExactlyInAnyOrder("tenant-a", "tenant-b", "tenant-c");
+                        "Host", List.of("warehouse-one." + DOMAIN),
+                        "X-Trino-User", List.of("warehouse-two.mallory"),
+                        "X-Trino-Original-User", List.of("warehouse-two.mallory"))),
+                DOMAINS,
+                EXCLUDED);
+        assertThat(principal).contains("warehouse-one.alice");
     }
 
     @Test
     void theCredentialIsDecodedAsIsoLatinOneLikeTheCoordinator()
     {
-        // 0xE9 is a single ISO-8859-1 character and a malformed UTF-8 sequence. Decoding it as UTF-8
-        // would key the restriction on a different string than the one the coordinator authenticates.
-        byte[] credential = "café.alice:secret".getBytes(ISO_8859_1);
-        String header = "Basic " + Base64.getEncoder().encodeToString(credential);
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(header), "Host", List.of(DOMAIN))), DOMAIN);
-        assertThat(candidates.principals()).containsExactly("café.alice");
-        assertThat(candidates.tenants()).containsExactly("café");
+        // This byte is one ISO-8859-1 character and a malformed UTF-8 sequence. Decoding it as UTF-8
+        // would key the restriction on a different string than the coordinator authenticates.
+        byte[] credential = "café:secret".getBytes(ISO_8859_1);
+        assertThat(authorized("Basic " + Base64.getEncoder().encodeToString(credential), DOMAIN, DOMAINS)).contains("café");
         assertThat(new String(credential, UTF_8)).isNotEqualTo(new String(credential, ISO_8859_1));
     }
 
     @Test
     void aBearerCredentialNeverKeysTheRestriction()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of("Bearer some.jwt.value"), "Host", List.of("tenant-a." + DOMAIN))), DOMAIN);
-        assertThat(candidates.principals()).isEmpty();
-        assertThat(candidates.tenants()).isEmpty();
+        assertThat(authorized("Bearer some.jwt.value", "warehouse-one." + DOMAIN, DOMAINS)).isEmpty();
     }
 
     @Test
     void aMalformedOrEmptyUserCredentialIsRefused()
     {
-        assertThatThrownBy(() -> TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of("Basic not-base64!!"), "Host", List.of(DOMAIN))), DOMAIN))
+        assertThatThrownBy(() -> authorized("Basic not-base64!!", DOMAIN, DOMAINS))
                 .isInstanceOfSatisfying(WebApplicationException.class, failure -> assertThat(failure.getResponse().getStatus()).isEqualTo(401));
-        assertThatThrownBy(() -> TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("", "secret")), "Host", List.of(DOMAIN))), DOMAIN))
+        assertThatThrownBy(() -> principal("", DOMAIN))
                 .isInstanceOfSatisfying(WebApplicationException.class, failure -> assertThat(failure.getResponse().getStatus()).isEqualTo(401));
     }
 
     @Test
     void duplicateIdentityHeadersAreRefusedRatherThanCoalesced()
     {
-        assertThatThrownBy(() -> TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "a"), basic("bob", "b")), "Host", List.of(DOMAIN))), DOMAIN))
+        assertThatThrownBy(() -> TenantPrincipals.authenticatedPrincipal(
+                request(Map.of("Authorization", List.of(basic("alice", "a"), basic("bob", "b")), "Host", List.of(DOMAIN))),
+                DOMAINS,
+                EXCLUDED))
                 .isInstanceOfSatisfying(WebApplicationException.class, failure -> assertThat(failure.getResponse().getStatus()).isEqualTo(400));
-        assertThatThrownBy(() -> TenantPrincipals.candidates(
-                request(Map.of(
-                        "Authorization", List.of(basic("alice", "a")),
-                        "Host", List.of(DOMAIN),
-                        "X-Trino-User", List.of("one", "two"))),
-                DOMAIN))
+        assertThatThrownBy(() -> TenantPrincipals.authenticatedPrincipal(
+                request(Map.of("Authorization", List.of(basic("alice", "a")), "Host", List.of(DOMAIN, "other." + DOMAIN))),
+                DOMAINS,
+                EXCLUDED))
                 .isInstanceOfSatisfying(WebApplicationException.class, failure -> assertThat(failure.getResponse().getStatus()).isEqualTo(400));
     }
 
     @Test
-    void aClientSuppliedForwardedHostNeverChangesTheKey()
+    void aClientSuppliedForwardedHostNeverChangesTheCandidates()
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
+        Optional<String> principal = TenantPrincipals.authenticatedPrincipal(
                 request(Map.of(
                         "Authorization", List.of(basic("alice", "secret")),
-                        "Host", List.of("tenant-a." + DOMAIN),
-                        "X-Forwarded-Host", List.of("tenant-b." + DOMAIN),
-                        "Forwarded", List.of("host=tenant-c." + DOMAIN))),
-                DOMAIN);
-        assertThat(candidates.tenants()).containsExactly("tenant-a");
+                        "Host", List.of("warehouse-one." + DOMAIN),
+                        "X-Forwarded-Host", List.of("warehouse-nine." + DOMAIN),
+                        "Forwarded", List.of("host=warehouse-nine." + DOMAIN))),
+                DOMAINS,
+                EXCLUDED);
+        assertThat(principal).contains("warehouse-one.alice");
         assertThat(TenantPrincipals.isForwardedHeader("X-Forwarded-Host")).isTrue();
         assertThat(TenantPrincipals.isForwardedHeader("forwarded")).isTrue();
         assertThat(TenantPrincipals.isForwardedHeader("Host")).isFalse();
     }
 
-    @Test
-    void thePortAndCaseOfTheRoutedHostDoNotChangeTheKey()
+    private static Optional<String> principal(String user, String host)
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "secret")), "Host", List.of("Tenant-A." + DOMAIN + ":8443"))), DOMAIN);
-        assertThat(candidates.tenants()).containsExactly("tenant-a");
+        return principal(user, host, DOMAINS);
     }
 
-    @Test
-    void noQualificationDomainMeansNoQualifiedCandidate()
+    private static Optional<String> principal(String user, String host, List<String> domains)
     {
-        TenantPrincipals.Candidates candidates = TenantPrincipals.candidates(
-                request(Map.of("Authorization", List.of(basic("alice", "secret")), "Host", List.of("tenant-a." + DOMAIN))), null);
-        assertThat(candidates.principals()).containsExactly("alice");
-        assertThat(candidates.tenants()).isEmpty();
+        return authorized(basic(user, "secret"), host, domains);
+    }
+
+    private static Optional<String> authorized(String authorization, String host, List<String> domains)
+    {
+        return TenantPrincipals.authenticatedPrincipal(
+                request(Map.of("Authorization", List.of(authorization), "Host", List.of(host))),
+                domains,
+                EXCLUDED);
     }
 
     private static String basic(String user, String password)

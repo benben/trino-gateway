@@ -225,6 +225,15 @@ public class PoolResource
         return service.tenantAdmission(poolId, tenant);
     }
 
+    @PUT
+    @Path("/{poolId}/tenants/{tenant}/principals")
+    @Consumes(APPLICATION_JSON)
+    public PoolStore.TenantAdmission principals(@PathParam("poolId") String poolId, @PathParam("tenant") String tenant, JsonNode body, @Context HttpServletRequest request)
+    {
+        service.requireAdmin(request);
+        return service.publishTenantPrincipals(poolId, tenant, body);
+    }
+
     @DELETE
     @Path("/{poolId}/tenants/{tenant}")
     @Consumes(APPLICATION_JSON)

@@ -172,8 +172,9 @@ public class TransactionAwarenessService
                             throw error(400, "Transaction-aware routing does not support external request-header rewrites");
                         }
                         String group = selection.routingGroup() == null || selection.routingGroup().isEmpty() ? defaultRoutingGroup : selection.routingGroup();
-                        if (poolConfig.isEnabled() && pools.isPooled(group)) {
-                            admission = admitPooled(group, owner, lease, request);
+                        PoolStore.PoolRouting pooled = poolConfig.isEnabled() ? pools.routing(group) : new PoolStore.PoolRouting(false, List.of());
+                        if (pooled.pooled()) {
+                            admission = admitPooled(group, owner, lease, request, pooled);
                             // The coordinator may honour forwarded headers when qualifying the principal it
                             // authenticates, so a client-supplied Forwarded/X-Forwarded-* value must not reach
                             // it: otherwise a caller could present one host to the admission restriction and
@@ -242,12 +243,15 @@ public class TransactionAwarenessService
      * {@code maxPreDispatchCandidates} and by the original request deadline. After dispatch nothing is
      * reselected, retried or replayed.
      */
-    private Admission admitPooled(String group, String owner, TransactionRequestCapacity.Lease lease, HttpServletRequest request)
+    private Admission admitPooled(String group, String owner, TransactionRequestCapacity.Lease lease, HttpServletRequest request, PoolStore.PoolRouting pooled)
     {
         // Deny-only restriction, evaluated inside the admission transaction: it never grants access,
         // and it is not consulted for continuations, so already dispatched work stays pinned.
         TransactionStore.TenantGate gate = poolConfig.hasVerifiedTenantIdentity()
-                ? new TransactionStore.TenantGate(TenantPrincipals.candidates(request, poolConfig.getHostQualificationDomain()).tenants())
+                ? new TransactionStore.TenantGate(TenantPrincipals.authenticatedPrincipal(
+                request,
+                poolConfig.getHostQualificationDomains(),
+                Set.copyOf(poolConfig.getExcludedHostLabels())).orElse(null))
                 : null;
         // Registration existence, not the legacy active flag, is the legacy fact that matters here.
         // A pooled member's registration is created inactive on purpose: flipping it active through the
@@ -258,7 +262,7 @@ public class TransactionAwarenessService
                 .filter(backend -> group.equals(backend.getRoutingGroup()))
                 .map(ProxyBackendConfiguration::getName)
                 .collect(java.util.stream.Collectors.toSet());
-        List<PoolStore.Candidate> eligible = new ArrayList<>(pools.eligibleCandidates(group).stream()
+        List<PoolStore.Candidate> eligible = new ArrayList<>(pooled.candidates().stream()
                 .filter(candidate -> legacyCandidates.contains(candidate.backendName()))
                 .toList());
         if (eligible.isEmpty()) {
@@ -713,7 +717,10 @@ public class TransactionAwarenessService
 
     private void verifyProcess(BackendRef backend, Duration remaining)
     {
-        JsonNode info = processInfo(backend.url(), remaining);
+        // A pooled member is reached over internal HTTP, so its verification probe describes the
+        // original protocol exactly as its registration probe does. A legacy backend is probed with
+        // the request it has always received.
+        JsonNode info = processInfo(backend.url(), remaining, backend.poolId() != null && poolConfig.isForwardedProtoHttps());
         if (!backend.nodeId().equals(info.path("nodeId").asText()) || !backend.coordinatorId().equals(info.path("coordinatorId").asText())) {
             throw error(409, "The original coordinator process is no longer available");
         }
@@ -721,23 +728,41 @@ public class TransactionAwarenessService
 
     private JsonNode processInfo(String backend)
     {
-        return processInfo(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
+        return processInfo(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS), false);
     }
 
     /**
-     * Observed coordinator process identity for the pooled lifecycle protocol. The Gateway verifies
-     * this itself; an operator assertion is never accepted as a Gateway probe.
+     * Observed coordinator process identity of a <em>pooled</em> member. The Gateway verifies this
+     * itself; an operator assertion is never accepted as a Gateway probe.
      */
     JsonNode processIdentity(String backendUrl)
     {
-        return processInfo(backendUrl);
+        return processInfo(backendUrl, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS), poolConfig.isForwardedProtoHttps());
     }
 
     private JsonNode processInfo(String backend, Duration remaining)
     {
+        return processInfo(backend, remaining, false);
+    }
+
+    /**
+     * @param forwardedProtoHttps asserts the original protocol of a request that terminated its TLS at
+     *         the Gateway. Only a pooled member's probe may pass true, and only when configured, so a
+     *         legacy backend is probed with exactly the request it received before this protocol
+     *         existed. Nothing here weakens what the coordinator requires of the request.
+     */
+    private JsonNode processInfo(String backend, Duration remaining, boolean forwardedProtoHttps)
+    {
         Duration timeout = new Duration(Math.max(1, Math.min(config.getProcessInfoTimeoutMillis(), remaining.toMillis())), MILLISECONDS);
-        StringResponse response = httpClient.execute(prepareGet().setUri(URI.create(backend + "/v1/info"))
-                .setRequestTimeout(timeout).setIdleTimeout(timeout).setFollowRedirects(false).build(), createStringResponseHandler());
+        io.airlift.http.client.Request.Builder probe = prepareGet().setUri(URI.create(backend + "/v1/info"))
+                .setRequestTimeout(timeout).setIdleTimeout(timeout).setFollowRedirects(false);
+        if (forwardedProtoHttps) {
+            // Only the protocol is asserted. No forwarded host is sent: a management probe must not be
+            // able to host-qualify its own principal against an internal Service name, and this probe
+            // carries no tenant credential at all.
+            probe.addHeader(io.airlift.http.client.HeaderNames.X_FORWARDED_PROTO, "https");
+        }
+        StringResponse response = httpClient.execute(probe.build(), createStringResponseHandler());
         try {
             JsonNode info = JSON.readTree(response.getBody());
             if (response.getStatusCode() != 200 || info == null || !info.path("coordinator").asBoolean() || info.path("starting").asBoolean(true) || info.path("nodeId").asText().isBlank() || !info.path("coordinatorId").asText().matches("[a-zA-Z0-9]{5}")) {

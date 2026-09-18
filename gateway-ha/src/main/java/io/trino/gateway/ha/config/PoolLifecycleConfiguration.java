@@ -22,15 +22,14 @@ import java.util.List;
 public class PoolLifecycleConfiguration
 {
     /**
-     * Sources of a verified tenant identity for the final admission gate. {@code NONE} is the only
-     * supported value today, so a pool cannot enable the tenant gate and the Gateway never pretends
-     * that a request header identifies a tenant. No customer-visible client change is implied.
+     * The restriction is absent. Nothing infers a tenant, and a pool cannot enable its admission gate.
      */
     public static final String TENANT_IDENTITY_NONE = "NONE";
     /**
      * The name the coordinator's password authenticator verifies: the Basic credential's user, host
      * qualified exactly as the coordinator qualifies it. The Gateway never verifies the credential
-     * itself; it only refuses to dispatch new work for a tenant that is not admitted yet.
+     * itself, and never derives a tenant from the name — the tenant comes from the
+     * controller-published principal mapping.
      */
     public static final String TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL = "TRINO_BASIC_PRINCIPAL";
 
@@ -38,10 +37,12 @@ public class PoolLifecycleConfiguration
 
     private boolean enabled;
     private String tenantIdentitySource = TENANT_IDENTITY_NONE;
-    private String hostQualificationDomain;
+    private List<String> hostQualificationDomains = List.of();
+    private List<String> excludedHostLabels = List.of();
     private int maxPreDispatchCandidates = 3;
     private int certificateFreshnessSeconds = 300;
     private int operationRetentionDays = 30;
+    private boolean forwardedProtoHttps;
 
     public boolean isEnabled()
     {
@@ -72,18 +73,33 @@ public class PoolLifecycleConfiguration
     }
 
     /**
-     * Domain under which a coordinator qualifies a bare Basic user with the request host's leading
-     * label. The restriction must recompute the same string the coordinator authenticates, so this is
-     * required whenever the principal source is enabled.
+     * Domains under which a coordinator qualifies a Basic user with the routed host's leading label.
+     * The restriction must recompute the same string the coordinator authenticates, so these must
+     * equal the coordinator's own configured domains whenever the principal source is enabled.
      */
-    public String getHostQualificationDomain()
+    public List<String> getHostQualificationDomains()
     {
-        return hostQualificationDomain;
+        return hostQualificationDomains;
     }
 
-    public void setHostQualificationDomain(String hostQualificationDomain)
+    public void setHostQualificationDomains(List<String> hostQualificationDomains)
     {
-        this.hostQualificationDomain = hostQualificationDomain;
+        this.hostQualificationDomains = hostQualificationDomains == null ? List.of() : List.copyOf(hostQualificationDomains);
+    }
+
+    /**
+     * Host labels under those domains that name something operational rather than a tenant. These must
+     * equal the coordinator's own exclusions, so a request to an operational host qualifies the same
+     * way on both sides.
+     */
+    public List<String> getExcludedHostLabels()
+    {
+        return excludedHostLabels;
+    }
+
+    public void setExcludedHostLabels(List<String> excludedHostLabels)
+    {
+        this.excludedHostLabels = excludedHostLabels == null ? List.of() : List.copyOf(excludedHostLabels);
     }
 
     public int getMaxPreDispatchCandidates()
@@ -116,6 +132,25 @@ public class PoolLifecycleConfiguration
         this.operationRetentionDays = operationRetentionDays;
     }
 
+    /**
+     * Whether a <em>pooled</em> member's identity probe asserts {@code X-Forwarded-Proto: https}.
+     * <p>
+     * A pooled member is reached over internal plain HTTP while TLS terminates at the Gateway, so a
+     * coordinator that processes forwarded headers needs to be told the original protocol. Disabled by
+     * default, and it applies only to probes of pooled members: probing of legacy backends is
+     * byte-for-byte unchanged whether or not this is set. It relaxes nothing on the coordinator and
+     * never substitutes for authentication.
+     */
+    public boolean isForwardedProtoHttps()
+    {
+        return forwardedProtoHttps;
+    }
+
+    public void setForwardedProtoHttps(boolean forwardedProtoHttps)
+    {
+        this.forwardedProtoHttps = forwardedProtoHttps;
+    }
+
     public void validate(boolean transactionAwarenessEnabled)
     {
         if (!enabled) {
@@ -127,10 +162,15 @@ public class PoolLifecycleConfiguration
         if (tenantIdentitySource == null || !TENANT_IDENTITY_SOURCES.contains(tenantIdentitySource)) {
             throw new IllegalArgumentException("tenantIdentitySource must be one of " + TENANT_IDENTITY_SOURCES);
         }
-        if (TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL.equals(tenantIdentitySource)
-                && (hostQualificationDomain == null || hostQualificationDomain.isBlank() || hostQualificationDomain.startsWith("."))) {
-            throw new IllegalArgumentException("tenantIdentitySource TRINO_BASIC_PRINCIPAL requires hostQualificationDomain, "
-                    + "so the restriction keys on the same principal the coordinator authenticates");
+        if (TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL.equals(tenantIdentitySource)) {
+            // A coordinator may authenticate an unqualified name, so an empty domain list is valid: the
+            // credential itself is then the only candidate. A malformed domain is not.
+            for (String domain : hostQualificationDomains) {
+                if (domain == null || domain.isBlank() || domain.startsWith(".") || domain.endsWith("..")) {
+                    throw new IllegalArgumentException("hostQualificationDomains must contain absolute domains, "
+                            + "so the restriction keys on the same principal the coordinator authenticates");
+                }
+            }
         }
         if (maxPreDispatchCandidates < 1 || maxPreDispatchCandidates > 10) {
             throw new IllegalArgumentException("maxPreDispatchCandidates must be between 1 and 10");

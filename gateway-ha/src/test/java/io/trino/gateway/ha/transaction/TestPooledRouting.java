@@ -118,6 +118,7 @@ class TestPooledRouting
         for (String version : new String[] {
                 "V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql",
                 "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql",
+                "V11__pool_tenant_principals.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -147,7 +148,7 @@ class TestPooledRouting
     {
         database.useHandle(handle -> handle.execute(
                 """
-                TRUNCATE pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
+                TRUNCATE pool_tenant_principal, pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
                   pool_member_certificate, pool_operation, pool, transaction_rollout, transaction_route,
                   transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend
                 """));
@@ -340,50 +341,125 @@ class TestPooledRouting
     // --------------------------------------------------------------------------------------------
 
     @Test
-    void anUnadmittedTenantIsRefusedBeforeDispatchAndAnAdmittedOneRoutes()
+    void anAdmittedBareMappingCannotAdmitAnUnmappedQualifiedPrincipal()
     {
         enableTenantGate();
         member("i-1", true);
         probeSucceeds();
+        // One tenant publishes a bare login and is admitted.
+        publishPrincipals("org-bare", "warehouse-bare");
+        admitTenant("org-bare");
 
-        // No admission record at all: fail closed, and no durable admission is left behind.
-        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", "tenant-a." + DOMAIN, Map.of()));
+        // A request to another warehouse's host presents the same user name. The coordinator qualifies
+        // before it authenticates and checks only "warehouse-b.warehouse-bare", so the admitted bare
+        // mapping says nothing about this request. The unmapped qualified principal must fail closed.
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("warehouse-bare", "warehouse-b." + DOMAIN, Map.of()));
         assertThat(admissionCount()).isZero();
 
-        // Publication in progress is still not admitted.
-        database.useHandle(handle -> handle.createUpdate(
-                        "INSERT INTO pool_tenant_admission (pool_id, tenant, state) VALUES (:pool, 'tenant-a', 'PENDING')")
-                .bind("pool", POOL).execute());
-        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", "tenant-a." + DOMAIN, Map.of()));
+        // Publishing it for a tenant whose publication has not completed still refuses.
+        publishPrincipals("org-b", "warehouse-b", "warehouse-b.warehouse-bare");
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("warehouse-bare", "warehouse-b." + DOMAIN, Map.of()));
 
-        admitTenant("tenant-a");
-        assertThat(resolveAs("alice", "tenant-a." + DOMAIN, Map.of()).routingDestination().clusterHost())
-                .isEqualTo("http://i-1.example.test");
-        // Every user of one admitted warehouse is admitted, because the tenant is the qualified prefix.
-        assertThat(resolveAs("bob", "tenant-a." + DOMAIN, Map.of()).routingDestination().clusterHost())
+        // Only admitting that tenant lets the qualified principal through.
+        admitTenant("org-b");
+        assertThat(resolveAs("warehouse-bare", "warehouse-b." + DOMAIN, Map.of()).routingDestination().clusterHost())
                 .isEqualTo("http://i-1.example.test");
     }
 
     @Test
-    void aSpoofedForwardedHostCannotMoveTheRestrictionToAnotherTenant()
+    void anUnusedBareMappingCannotBlockAnAdmittedQualifiedPrincipal()
     {
         enableTenantGate();
         member("i-1", true);
         probeSucceeds();
-        admitTenant("tenant-a");
+        // The qualified principal is admitted; a same-named bare principal belongs to a tenant that is
+        // still pending. The coordinator would never authenticate the bare name for this request, so
+        // the pending tenant must not block it either.
+        publishPrincipals("org-a", "warehouse-a", "warehouse-a.alice");
+        admitTenant("org-a");
+        publishPrincipals("org-pending", "alice");
 
-        // Host names the admitted tenant, X-Forwarded-Host names the unadmitted one the coordinator
-        // would qualify with. The restriction must not be satisfiable by the routed host alone.
+        assertThat(resolveAs("alice", "warehouse-a." + DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://i-1.example.test");
+    }
+
+    @Test
+    void anUnpublishedPrincipalIsRefusedAndAPublishedAdmittedOneRoutes()
+    {
+        enableTenantGate();
+        member("i-1", true);
+        probeSucceeds();
+
+        // Nothing published for this principal: unknown fails closed, with no durable admission left.
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", "warehouse-one." + DOMAIN, Map.of()));
+        assertThat(admissionCount()).isZero();
+
+        // Published, but its tenant's publication has not completed yet.
+        publishPrincipals("org-7", "warehouse-one", "warehouse-one.alice", "warehouse-one.bob");
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", "warehouse-one." + DOMAIN, Map.of()));
+
+        admitTenant("org-7");
+        // The qualified principal is published, so the request is dispatched.
+        assertThat(resolveAs("alice", "warehouse-one." + DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://i-1.example.test");
+        // Every published user of the same warehouse is covered by that one tenant record.
+        assertThat(resolveAs("bob", "warehouse-one." + DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://i-1.example.test");
+        // A user of that warehouse that was never published stays refused.
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("carol", "warehouse-one." + DOMAIN, Map.of()));
+    }
+
+    @Test
+    void aBareRootLoginIsAdmittedWhenItIsPublished()
+    {
+        enableTenantGate();
+        member("i-1", true);
+        probeSucceeds();
+        // A tenant's root login is the bare warehouse name with no separator, and its tenant identifier
+        // is unrelated to it. Only the published mapping can connect the two.
+        publishPrincipals("org-42", "warehouse-one", "warehouse-one.alice");
+        admitTenant("org-42");
+
+        // Sent to the apex host, so the coordinator would authenticate the name as presented.
+        assertThat(resolveAs("warehouse-one", DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://i-1.example.test");
+        // And to the tenant host, where the coordinator qualifies it; both forms are candidates.
+        assertThat(resolveAs("alice", "warehouse-one." + DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://i-1.example.test");
+    }
+
+    @Test
+    void aForgedUserHeaderCannotAdmitAPendingPrincipal()
+    {
+        enableTenantGate();
+        member("i-1", true);
+        probeSucceeds();
+        publishPrincipals("org-admitted", "warehouse-two", "warehouse-two.alice");
+        admitTenant("org-admitted");
+        publishPrincipals("org-pending", "warehouse-three", "warehouse-three.mallory");
+
+        // The credential belongs to a tenant whose publication has not completed. Naming an admitted
+        // principal in a user header is not evidence of authentication and changes nothing.
         expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs(
-                "alice",
-                "tenant-a." + DOMAIN,
-                Map.of("X-Trino-User", List.of("tenant-b.alice"))));
+                "mallory",
+                "warehouse-three." + DOMAIN,
+                Map.of("X-Trino-User", List.of("warehouse-two.alice"), "X-Trino-Original-User", List.of("warehouse-two.alice"))));
+        assertThat(admissionCount()).isZero();
+    }
 
-        // And a client-supplied forwarded host never reaches the coordinator.
+    @Test
+    void aClientSuppliedForwardedHostNeverReachesTheCoordinator()
+    {
+        enableTenantGate();
+        member("i-1", true);
+        probeSucceeds();
+        publishPrincipals("org-7", "warehouse-one", "warehouse-one.alice");
+        admitTenant("org-7");
+
         RoutingTargetResponse response = resolveAs(
                 "alice",
-                "tenant-a." + DOMAIN,
-                Map.of("X-Forwarded-Host", List.of("tenant-b." + DOMAIN), "Forwarded", List.of("host=tenant-b." + DOMAIN)));
+                "warehouse-one." + DOMAIN,
+                Map.of("X-Forwarded-Host", List.of("warehouse-nine." + DOMAIN), "Forwarded", List.of("host=warehouse-nine." + DOMAIN)));
         assertThat(response.modifiedRequest().getHeader("X-Forwarded-Host")).isNull();
         assertThat(response.modifiedRequest().getHeader("Forwarded")).isNull();
         assertThat(Collections.list(response.modifiedRequest().getHeaderNames()))
@@ -391,14 +467,16 @@ class TestPooledRouting
     }
 
     @Test
-    void anUnqualifiableCredentialNamesNoTenantAndIsRefused()
+    void anExcludedHostLabelDoesNotQualifyAPrincipalIntoATenant()
     {
         enableTenantGate();
         member("i-1", true);
         probeSucceeds();
-        admitTenant("tenant-a");
-        // Apex host: the coordinator cannot qualify the user, so the request names no tenant.
-        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", DOMAIN, Map.of()));
+        // "internal" is an operational host, not a warehouse; the coordinator excludes it too, so the
+        // qualified form must not become a candidate.
+        publishPrincipals("org-7", "internal", "internal.alice");
+        admitTenant("org-7");
+        expectStatus(403, "TENANT_NOT_ADMITTED", () -> resolveAs("alice", "internal." + DOMAIN, Map.of()));
     }
 
     @Test
@@ -433,7 +511,8 @@ class TestPooledRouting
         service.shutdown();
         configuration.getTransactionAwareness().getPool()
                 .setTenantIdentitySource(io.trino.gateway.ha.config.PoolLifecycleConfiguration.TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
-        configuration.getTransactionAwareness().getPool().setHostQualificationDomain(DOMAIN);
+        configuration.getTransactionAwareness().getPool().setHostQualificationDomains(List.of(DOMAIN));
+        configuration.getTransactionAwareness().getPool().setExcludedHostLabels(List.of("internal"));
         configuration.getTransactionAwareness().validate(configuration.getDataStore());
         service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector);
         service.setRoutingManager(routingManager);
@@ -442,6 +521,17 @@ class TestPooledRouting
                 guard("op-gate", "configure"),
                 new PoolStore.PoolSpec("POOLED", 1, 3, 1, 1, "r-1", true),
                 true);
+    }
+
+    /**
+     * Publishes a tenant's authoritative principal set, as the controller does.
+     */
+    private void publishPrincipals(String tenant, String warehouse, String... users)
+    {
+        List<String> principals = new java.util.ArrayList<>();
+        principals.add(warehouse);
+        principals.addAll(List.of(users));
+        pools.publishTenantPrincipals(POOL, tenant, guard("op-principals-" + tenant, "principals"), "rev-1", List.copyOf(principals));
     }
 
     private void admitTenant(String tenant)

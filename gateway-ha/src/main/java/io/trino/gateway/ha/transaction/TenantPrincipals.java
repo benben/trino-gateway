@@ -17,100 +17,103 @@ import jakarta.servlet.http.HttpServletRequest;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
-import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 import static io.trino.gateway.ha.transaction.TransactionIdentity.error;
 import static io.trino.gateway.ha.transaction.TransactionIdentity.singleHeader;
 
 /**
- * Derives the tenant names a request could possibly execute as, for the deny-only pooled admission
- * restriction.
+ * Derives the single principal a request will be authenticated as, for the deny-only pooled
+ * admission restriction. The tenant that principal belongs to is looked up in the
+ * controller-published mapping; it is never inferred from the shape of a name.
  * <p>
  * This is deliberately <em>not</em> authentication. The coordinator verifies the forwarded Basic
  * credential itself on every statement, and its authorization policy refuses impersonation, so a
  * claimed name can never become an authenticated principal here. The restriction only refuses to
- * dispatch work whose claimed tenant is not admitted yet; absence of a claim grants nothing.
+ * dispatch work whose tenant is not admitted yet; absence of a claim grants nothing.
  * <p>
- * Parsing mirrors the coordinator byte for byte, because a gate keyed on a different string than the
- * one the coordinator authenticates would be trivially bypassable:
+ * Parsing mirrors the coordinator byte for byte, because a restriction keyed on a different string
+ * than the one the coordinator authenticates would be either bypassable or needlessly blocking:
  * <ul>
  *   <li>the credential is decoded as ISO-8859-1, not UTF-8;</li>
  *   <li>the scheme is matched as an exact case-insensitive {@code "Basic "} prefix;</li>
  *   <li>the decoded value is split on its first colon and an empty user is refused;</li>
  *   <li>a duplicate or empty identity header is refused rather than silently coalesced;</li>
- *   <li>host qualification is recomputed from the same inputs, so every name the coordinator could
- *       authenticate appears as a candidate.</li>
+ *   <li>host qualification is recomputed from the same inputs and produces <em>one</em> name. The
+ *       coordinator qualifies before it authenticates and checks only the qualified name, with no
+ *       fallback to the name as typed, so treating both as alternatives would let a request whose
+ *       qualified principal is unmapped pass on an unrelated bare mapping.</li>
  * </ul>
  */
 public final class TenantPrincipals
 {
     private TenantPrincipals() {}
 
-    /**
-     * Every name this request could be authenticated as, together with the tenants those names
-     * belong to. A request is refused when any known candidate tenant is not admitted, or when no
-     * candidate names an admitted tenant at all.
-     */
-    public record Candidates(Set<String> principals, Set<String> tenants) {}
+    private static final Pattern HOST_LABEL = Pattern.compile("[a-z0-9]([a-z0-9-]*[a-z0-9])?");
 
     /**
-     * @param hostQualificationDomain the domain under which the coordinator qualifies a bare user
-     *         with the request host's single leading label, exactly as the coordinator's password
-     *         authenticator does before verifying the credential.
+     * Returns the one name this request will be authenticated as: the credential's user qualified by
+     * the routed host when qualification applies, and the user exactly as presented when it does not.
+     * Empty when the request presents no Basic credential.
+     * <p>
+     * A request-supplied user header is deliberately never consulted — it is not evidence of
+     * authentication, and user selection and impersonation stay enforced by the coordinator and its
+     * policy. The returned name is only a lookup key; its tenant comes from the published mapping.
+     *
+     * @param hostQualificationDomains domains under which the coordinator qualifies a user with the
+     *         routed host's single leading label, exactly as its password authenticator does before
+     *         verifying the credential.
+     * @param excludedHostLabels labels under those domains that name something operational rather
+     *         than a tenant, matching the coordinator's own exclusions.
      */
-    public static Candidates candidates(HttpServletRequest request, String hostQualificationDomain)
+    public static Optional<String> authenticatedPrincipal(HttpServletRequest request, List<String> hostQualificationDomains, Set<String> excludedHostLabels)
     {
-        Set<String> principals = new LinkedHashSet<>();
-        basicUser(request).ifPresent(user -> {
-            principals.add(user);
-            qualify(user, request, hostQualificationDomain).ifPresent(principals::add);
-        });
-        singleHeader(request, "X-Trino-User").filter(value -> !value.isBlank()).ifPresent(principals::add);
-        singleHeader(request, "X-Trino-Original-User").filter(value -> !value.isBlank()).ifPresent(principals::add);
-
-        Set<String> tenants = new LinkedHashSet<>();
-        for (String principal : principals) {
-            tenantOf(principal).ifPresent(tenants::add);
-        }
-        return new Candidates(Set.copyOf(principals), Set.copyOf(tenants));
+        return basicUser(request).map(user -> qualify(user, request, hostQualificationDomains, excludedHostLabels).orElse(user));
     }
 
     /**
-     * The tenant a principal belongs to: the leading label of a qualified principal. A bare name
-     * carries no tenant, so it can never satisfy the restriction on its own.
+     * Recomputes the coordinator's host qualification: a routed host of exactly one permitted label
+     * under a configured domain qualifies the user as {@code <label>.<user>}. Anything else leaves
+     * the user unchanged, so the bare credential remains the only candidate.
      */
-    public static Optional<String> tenantOf(String principal)
+    public static Optional<String> qualify(String user, HttpServletRequest request, List<String> hostQualificationDomains, Set<String> excludedHostLabels)
     {
-        int separator = principal.indexOf('.');
-        if (separator < 1 || separator == principal.length() - 1) {
+        if (hostQualificationDomains == null || hostQualificationDomains.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(principal.substring(0, separator));
+        return requestHost(request).flatMap(host -> tenantLabel(host, hostQualificationDomains, excludedHostLabels))
+                .map(label -> label + "." + user);
     }
 
-    /**
-     * Recomputes the coordinator's host qualification: a request host of exactly one label under the
-     * configured domain qualifies the user as {@code <label>.<user>}.
-     */
-    public static Optional<String> qualify(String user, HttpServletRequest request, String hostQualificationDomain)
+    private static Optional<String> tenantLabel(String host, List<String> domains, Set<String> excludedHostLabels)
     {
-        if (hostQualificationDomain == null || hostQualificationDomain.isBlank() || user.indexOf('.') >= 0) {
-            return Optional.empty();
-        }
-        return requestHost(request).flatMap(host -> {
-            String suffix = "." + hostQualificationDomain;
+        Set<String> excluded = excludedHostLabels == null
+                ? Set.of()
+                : excludedHostLabels.stream().map(label -> label.toLowerCase(Locale.ENGLISH)).collect(java.util.stream.Collectors.toSet());
+        for (String domain : domains) {
+            if (domain == null || domain.isBlank()) {
+                continue;
+            }
+            String suffix = "." + stripTrailingDot(domain.trim().toLowerCase(Locale.ENGLISH)).replaceFirst("^\\.", "");
             if (!host.endsWith(suffix)) {
-                return Optional.empty();
+                continue;
             }
             String label = host.substring(0, host.length() - suffix.length());
-            if (label.isEmpty() || label.indexOf('.') >= 0) {
-                return Optional.empty();
+            // A longer configured domain may still match, so keep looking rather than giving up here.
+            if (HOST_LABEL.matcher(label).matches() && !excluded.contains(label)) {
+                return Optional.of(label);
             }
-            return Optional.of(label + "." + user);
-        });
+        }
+        return Optional.empty();
+    }
+
+    private static String stripTrailingDot(String value)
+    {
+        return value.endsWith(".") ? value.substring(0, value.length() - 1) : value;
     }
 
     /**
@@ -131,13 +134,16 @@ public final class TenantPrincipals
         String stripped = host;
         if (stripped.startsWith("[")) {
             int end = stripped.indexOf(']');
-            return end < 0 ? Optional.empty() : Optional.of(stripped.substring(0, end + 1).toLowerCase(java.util.Locale.ROOT));
+            return end < 0 ? Optional.empty() : Optional.of(stripped.substring(0, end + 1).toLowerCase(Locale.ENGLISH));
         }
         int colon = stripped.indexOf(':');
         if (colon >= 0) {
             stripped = stripped.substring(0, colon);
         }
-        return stripped.isBlank() ? Optional.empty() : Optional.of(stripped.toLowerCase(java.util.Locale.ROOT));
+        // The coordinator strips a root-zone trailing dot before it qualifies, so a fully qualified
+        // host must produce the same key on both sides.
+        stripped = stripTrailingDot(stripped);
+        return stripped.isBlank() ? Optional.empty() : Optional.of(stripped.toLowerCase(Locale.ENGLISH));
     }
 
     /**

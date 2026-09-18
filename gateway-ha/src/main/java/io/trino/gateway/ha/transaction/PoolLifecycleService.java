@@ -36,6 +36,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import static java.util.Objects.requireNonNull;
@@ -84,7 +85,9 @@ public class PoolLifecycleService
     {
         return guarded(() -> store.configurePool(
                 poolId,
-                guard(body),
+                // Configuring the pool is how a controller declares or takes authority, so its epoch
+                // and owner are part of what it is asking for, not merely who is asking.
+                guard(body, true),
                 new PoolStore.PoolSpec(
                         text(body, "apiMode"),
                         integer(body, "minServing"),
@@ -292,7 +295,32 @@ public class PoolLifecycleService
     public PoolStore.TenantAdmission tenantAdmission(String poolId, String tenant)
     {
         return guarded(() -> store.tenantAdmission(poolId, tenant)
-                .orElseGet(() -> new PoolStore.TenantAdmission(PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, false)));
+                .orElseGet(() -> new PoolStore.TenantAdmission(
+                        PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, null, List.of(), false)));
+    }
+
+    /**
+     * Publishes the exact principals that belong to a tenant.
+     * <p>
+     * The Gateway cannot derive these: a tenant's logins are produced by the controller's own
+     * projection, one of them carries no separator at all, and the tenant identifier is not a prefix
+     * of any of them. Publishing the set is what lets the restriction key on the same principal the
+     * coordinator authenticates instead of guessing at a naming convention.
+     */
+    public PoolStore.TenantAdmission publishTenantPrincipals(String poolId, String tenant, JsonNode body)
+    {
+        JsonNode principals = body == null ? null : body.path("principals");
+        if (principals == null || !principals.isArray() || principals.isEmpty()) {
+            throw poolError(400, "POOL_VALIDATION", "A non-empty principals array is required");
+        }
+        List<String> names = new ArrayList<>();
+        principals.forEach(principal -> {
+            if (!principal.isTextual()) {
+                throw poolError(400, "POOL_VALIDATION", "Every principal must be a string");
+            }
+            names.add(principal.asText());
+        });
+        return guarded(() -> store.publishTenantPrincipals(poolId, tenant, guard(body), text(body, "revision"), List.copyOf(names)));
     }
 
     public PoolStore.TenantAdmission revokeTenant(String poolId, String tenant, JsonNode body)
@@ -352,6 +380,19 @@ public class PoolLifecycleService
 
     private Guard guard(JsonNode body)
     {
+        return guard(body, false);
+    }
+
+    /**
+     * @param authorityIsTheIntent for a call whose purpose is to hold or take authority, rather than
+     *         to apply an effect under authority it already holds. Such a call keeps the epoch and
+     *         owner inside its intent hash, so a reissue under a <em>different</em> authority is not
+     *         mistaken for a replay of the previous one: returning the earlier result would report an
+     *         epoch that was never acquired. Ordinary effects exclude the envelope, which is what lets
+     *         the next leader resume a step its predecessor already committed.
+     */
+    private Guard guard(JsonNode body, boolean authorityIsTheIntent)
+    {
         if (body == null || !body.isObject()) {
             throw poolError(400, "POOL_VALIDATION", "A JSON object body is required");
         }
@@ -359,7 +400,7 @@ public class PoolLifecycleService
                 text(body, "operationId"),
                 text(body, "stepId"),
                 longValue(body, "controllerEpoch"),
-                canonicalHash(body),
+                authorityIsTheIntent ? canonicalHashWithAuthority(body) : canonicalHash(body),
                 optionalText(body, "ownerIdentity").orElse(null));
     }
 
@@ -407,14 +448,45 @@ public class PoolLifecycleService
     }
 
     /**
-     * SHA-256 over the canonical form of the request body, so an identical replay resolves to the
-     * recorded result and a changed intent under the same step identity is a conflict.
+     * Fields that carry which controller is acting, not what it is asking for.
+     * <p>
+     * They are excluded from the intent hash on purpose. A step reissued by the next leader after a
+     * takeover carries a different epoch and owner, and if those were part of the hash the reissued
+     * call could never resolve the outcome its predecessor already committed — the step would conflict
+     * with itself forever and the operation could not be resumed. Excluding them makes the recorded
+     * result readable by whoever holds authority next, while the authority fence still governs every
+     * <em>new</em> effect: the epoch and owner are checked before anything is applied.
+     */
+    private static final Set<String> AUTHORITY_ENVELOPE = Set.of("controllerEpoch", "ownerIdentity");
+
+    /**
+     * SHA-256 over the canonical form of the request body's business intent, so an identical replay
+     * resolves to the recorded result and a changed intent under the same step identity is a conflict.
      */
     static String canonicalHash(JsonNode body)
     {
+        return hash(body, true);
+    }
+
+    /**
+     * The same canonical hash, keeping the authority envelope, for a call that exists to hold or take
+     * authority. Without it, a reissue under a new epoch would resolve the earlier result and report an
+     * authority the caller never acquired.
+     */
+    static String canonicalHashWithAuthority(JsonNode body)
+    {
+        return hash(body, false);
+    }
+
+    private static String hash(JsonNode body, boolean excludeAuthorityEnvelope)
+    {
         try {
+            java.util.TreeMap<String, Object> intent = JSON.treeToValue(body, java.util.TreeMap.class);
+            if (excludeAuthorityEnvelope) {
+                AUTHORITY_ENVELOPE.forEach(intent::remove);
+            }
             byte[] canonical = JSON.writer(com.fasterxml.jackson.databind.SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
-                    .writeValueAsBytes(JSON.treeToValue(body, java.util.TreeMap.class));
+                    .writeValueAsBytes(intent);
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(canonical));
         }
         catch (JsonProcessingException e) {
